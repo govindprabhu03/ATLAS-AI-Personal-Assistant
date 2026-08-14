@@ -1,0 +1,15 @@
+# secrets — never commit
+.env
+backend/credentials*.json*
+backend/token*.json*
+backend/*secret*.json
+backend/settings.json
+backend/atlas.db
+
+# python / build
+backend/.venv/
+__pycache__/
+*.pyc
+
+# optional local avatar model
+frontend/avatar.glb

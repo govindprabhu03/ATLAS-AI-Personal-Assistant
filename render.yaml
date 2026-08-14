@@ -1,0 +1,41 @@
+# Render.com blueprint for ATLAS. Deploy: push this repo to GitHub, then in
+# Render -> New -> Blueprint -> pick the repo. Set the `sync: false` secrets in
+# the dashboard (they are never committed).
+services:
+  - type: web
+    name: atlas
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: ATLAS_MODEL
+        value: claude-sonnet-5
+      - key: ATLAS_TZ
+        value: Asia/Kolkata
+      # ---- secrets: set these in the Render dashboard (Environment tab) ----
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # Google Calendar + Gmail (optional). Generate token.json locally with
+      # `python authorize.py`, then paste file contents into these:
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: GOOGLE_TOKEN_JSON
+        sync: false
+      # Telegram channel (optional). Token from @BotFather. Set RUN_TELEGRAM_IN_WEB=1
+      # to run the bot inside this web service (no extra worker needed).
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: RUN_TELEGRAM_IN_WEB
+        value: "1"
+      # ---- durable storage (optional) ----
+      # Free tier has an EPHEMERAL disk: tasks reset when the instance restarts.
+      # For persistence, attach a Render Disk (paid) and point the DB at it:
+      #   - key: ATLAS_DB
+      #     value: /var/data/atlas.db
+      # ...and add a `disk:` block below. Or migrate to Supabase Postgres.

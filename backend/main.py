@@ -1,0 +1,554 @@
+"""ATLAS — Personal AI Manager. FastAPI backend (single-file, self-contained).
+
+Manager Loop: natural language -> extract goals/tasks/commitments/events ->
+decompose goals -> schedule work into free slots (around real Google Calendar
+meetings) -> daily brief with proactive follow-up on overdue commitments.
+
+Plus a live chat agent (/api/chat) that talks back and takes real actions
+through tools: capture items, create Google Calendar events, check the brief.
+
+Storage: SQLite (zero setup). Calendar sync activates once token.json exists.
+"""
+import os, json, sqlite3, datetime as dt
+from contextlib import closing
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / ".env")   # ATLAS/.env
+except ImportError:
+    pass
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+import calendar_client as gcal
+import gmail_client as gmail
+import web_client as web
+
+# ---- config ---------------------------------------------------------------
+DB_PATH = os.getenv("ATLAS_DB", str(Path(__file__).parent / "atlas.db"))
+MODEL = os.getenv("ATLAS_MODEL", "claude-sonnet-5")
+WORK_START, WORK_END = 9, 21
+BLOCK_MINUTES = 60
+FRONTEND = Path(__file__).parent.parent / "frontend"
+
+# ---- permission tiers -----------------------------------------------------
+# Outward/side-effecting tools default to "ask" (require user approval).
+# Levels: "auto" (do it) | "ask" (propose, wait for Approve in the UI).
+SETTINGS_PATH = Path(__file__).parent / "settings.json"
+DEFAULT_SETTINGS = {"create_calendar_event": "ask", "draft_email": "ask"}
+# Purchases ALWAYS require approval and can never be set to auto — ATLAS never pays.
+ALWAYS_ASK = {"propose_purchase"}
+
+def load_settings():
+    try:
+        return {**DEFAULT_SETTINGS, **json.loads(SETTINGS_PATH.read_text())}
+    except Exception:
+        return dict(DEFAULT_SETTINGS)
+
+def save_settings(s):
+    SETTINGS_PATH.write_text(json.dumps(s))
+
+def needs_approval(tool):
+    if tool in ALWAYS_ASK:
+        return True
+    return load_settings().get(tool, "auto") == "ask"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS items(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL,                       -- goal | task | commitment | event
+  title TEXT NOT NULL,
+  parent_id INTEGER,
+  priority TEXT DEFAULT 'routine',
+  status TEXT DEFAULT 'open',
+  deadline TEXT,
+  scheduled_start TEXT,
+  scheduled_end TEXT,
+  google_event_id TEXT,                     -- set when synced to Google Calendar
+  link TEXT,                                -- store/checkout URL for purchases
+  source_text TEXT,
+  created_at TEXT NOT NULL
+);
+"""
+
+def db():
+    c = sqlite3.connect(DB_PATH); c.row_factory = sqlite3.Row; return c
+
+def init_db():
+    with closing(db()) as c:
+        c.executescript(SCHEMA)
+        cols = [r[1] for r in c.execute("PRAGMA table_info(items)")]
+        if "link" not in cols:                       # migrate older DBs
+            c.execute("ALTER TABLE items ADD COLUMN link TEXT")
+        c.commit()
+
+def row_to_dict(r): return {k: r[k] for k in r.keys()}
+
+def parse_dt(x):
+    try: return dt.datetime.fromisoformat(x) if x else None
+    except (TypeError, ValueError): return None
+
+# ---- llm extraction -------------------------------------------------------
+EXTRACT_SYS = """You are the intake brain of ATLAS, a personal AI manager. Read \
+the user's note and extract structured items. Return ONLY JSON: {"items":[...]}. \
+Each item:
+  type: "goal" (multi-step project) | "task" (single action) |
+        "commitment" (a promise: "I'll call…","I need to…") |
+        "event" (a fixed appointment WITH a time)
+  title: short imperative phrase (<8 words)
+  priority: "critical" | "important" | "routine"
+  deadline: ISO 8601 date/datetime or null. For "event" put the start datetime
+            here. Resolve relative dates from the provided current datetime.
+  subtasks: ONLY for "goal" — 3-7 concrete step titles. Else [].
+Split compound notes into multiple items."""
+
+def call_claude(system, user, max_tokens=1500):
+    import anthropic
+    m = anthropic.Anthropic().messages.create(
+        model=MODEL, max_tokens=max_tokens, system=system,
+        messages=[{"role": "user", "content": user}])
+    return "".join(b.text for b in m.content if b.type == "text")
+
+def extract_items(text):
+    now = dt.datetime.now().isoformat(timespec="minutes")
+    raw = call_claude(EXTRACT_SYS, f"Current datetime: {now}\n\nNote:\n{text}").strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1].removeprefix("json").strip()
+    try:
+        return json.loads(raw).get("items", [])
+    except json.JSONDecodeError:
+        raise HTTPException(502, f"Could not parse extraction: {raw[:300]}")
+
+def _sync_event(c, item_id, title, start, end, priority):
+    """Create a real Google Calendar event for a scheduled block/appointment."""
+    if not gcal.is_configured():
+        return
+    try:
+        ev = gcal.create_event(title, start, end, f"ATLAS · {priority}")
+        c.execute("UPDATE items SET google_event_id=? WHERE id=?",
+                  (ev["id"], item_id))
+    except Exception as e:            # calendar issues never break capture
+        print("calendar sync failed:", e)
+
+def store_items(parsed, source):
+    created = []; now = dt.datetime.now().isoformat()
+    with closing(db()) as c:
+        for it in parsed:
+            typ = it.get("type", "task")
+            dl = it.get("deadline"); pri = it.get("priority", "routine")
+            ss = se = None
+            if typ == "event" and parse_dt(dl) and "T" in (dl or ""):
+                ss = dl; se = (parse_dt(dl) + dt.timedelta(hours=1)).isoformat()
+            cur = c.execute(
+                "INSERT INTO items(type,title,priority,deadline,scheduled_start,"
+                "scheduled_end,source_text,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (typ, it.get("title", "Untitled"), pri, dl, ss, se, source, now))
+            gid = cur.lastrowid; created.append(gid)
+            if ss:
+                _sync_event(c, gid, it.get("title", "Event"), ss, se, pri)
+            for st in (it.get("subtasks") or []):
+                title = st if isinstance(st, str) else st.get("title", "step")
+                c.execute(
+                    "INSERT INTO items(type,title,parent_id,priority,deadline,"
+                    "source_text,created_at) VALUES('task',?,?,?,?,?,?)",
+                    (title, gid, pri, dl, source, now))
+        c.commit()
+    schedule_unplanned()
+    return created
+
+# ---- planner --------------------------------------------------------------
+def _busy(c, horizon_days=60):
+    """Busy intervals from local scheduled items + real Google Calendar."""
+    out = []
+    for r in c.execute("SELECT scheduled_start,scheduled_end FROM items "
+                       "WHERE scheduled_start IS NOT NULL AND status='open'"):
+        s, e = parse_dt(r["scheduled_start"]), parse_dt(r["scheduled_end"])
+        if s and e: out.append((s, e))
+    if gcal.is_configured():
+        try:
+            now = dt.datetime.now()
+            out += gcal.busy_intervals(now, now + dt.timedelta(days=horizon_days))
+        except Exception as e:
+            print("calendar busy fetch failed:", e)
+    return out
+
+def _next_free_block(after, busy):
+    t = after.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
+    for _ in range(24 * 60):
+        if t.hour < WORK_START: t = t.replace(hour=WORK_START)
+        if t.hour >= WORK_END:
+            t = (t + dt.timedelta(days=1)).replace(hour=WORK_START)
+        end = t + dt.timedelta(minutes=BLOCK_MINUTES)
+        if not any(t < b_end and end > b_start for b_start, b_end in busy):
+            return t, end
+        t = end
+    return t, t + dt.timedelta(minutes=BLOCK_MINUTES)
+
+def schedule_unplanned():
+    """Give every open, unscheduled leaf task a work block before its deadline,
+    earliest-deadline-first, and push it to Google Calendar."""
+    with closing(db()) as c:
+        tasks = c.execute(
+            "SELECT * FROM items WHERE type='task' AND status='open' "
+            "AND scheduled_start IS NULL "
+            "AND id NOT IN (SELECT parent_id FROM items WHERE parent_id IS NOT NULL)"
+            " ORDER BY (deadline IS NULL), deadline").fetchall()
+        busy = _busy(c); cursor = dt.datetime.now()
+        for t in tasks:
+            start, end = _next_free_block(cursor, busy)
+            busy.append((start, end)); cursor = start
+            c.execute("UPDATE items SET scheduled_start=?,scheduled_end=? WHERE id=?",
+                      (start.isoformat(), end.isoformat(), t["id"]))
+            _sync_event(c, t["id"], t["title"], start.isoformat(),
+                        end.isoformat(), t["priority"])
+        c.commit()
+
+def _unsync(item_ids):
+    if not gcal.is_configured(): return
+    with closing(db()) as c:
+        q = ",".join("?" * len(item_ids))
+        for r in c.execute(f"SELECT google_event_id FROM items WHERE id IN ({q})"
+                           " AND google_event_id IS NOT NULL", item_ids):
+            try: gcal.delete_event(r["google_event_id"])
+            except Exception as e: print("calendar delete failed:", e)
+
+# ---- daily brief ----------------------------------------------------------
+def build_brief():
+    now = dt.datetime.now(); today = now.date()
+    tomorrow = today + dt.timedelta(days=1)
+    with closing(db()) as c:
+        rows = [row_to_dict(r) for r in
+                c.execute("SELECT * FROM items WHERE status='open'")]
+    counts = {"critical": 0, "important": 0, "routine": 0}
+    todays, attention, pending = [], [], []
+    for r in rows:
+        if r["type"] in ("task", "goal", "event"):
+            counts[r["priority"]] = counts.get(r["priority"], 0) + 1
+        ss, dl = parse_dt(r["scheduled_start"]), parse_dt(r["deadline"])
+        if ss and ss.date() == today: todays.append((ss, r))
+        if r["type"] == "commitment" and dl and dl < now:
+            attention.append(f"{r['title']} — commitment {(now - dl).days}d overdue")
+        elif dl and dl.date() <= tomorrow:
+            when = "today" if dl.date() == today else "tomorrow"
+            attention.append(f"{r['title']} — due {when}")
+        if r["type"] in ("task", "commitment") and not ss:
+            pending.append(r["title"])
+    todays.sort(key=lambda x: x[0])
+    schedule = [{"time": s.strftime("%H:%M"), "title": r["title"],
+                 "priority": r["priority"], "id": r["id"]} for s, r in todays]
+    hour = now.hour
+    greet = ("Good morning" if hour < 12 else
+             "Good afternoon" if hour < 17 else "Good evening")
+    av = load_settings().get("avatar_url")
+    if not av and (FRONTEND / "avatar.glb").exists():
+        av = "/static/avatar.glb"
+    return {"greeting": f"{greet}, Govind.", "date": today.isoformat(),
+            "counts": counts, "schedule": schedule,
+            "attention": attention[:8], "pending": pending[:8],
+            "calendar_connected": gcal.is_configured(), "avatar_url": av or ""}
+
+# ---- chat agent (tools) ---------------------------------------------------
+TOOLS = [
+ {"name": "capture", "description": "Extract & store goals/tasks/commitments/"
+  "events from natural language, decompose goals into subtasks, and schedule "
+  "them into free time (auto-syncs to Google Calendar). Use for anything the "
+  "user wants to remember, plan, or get done.",
+  "input_schema": {"type": "object", "properties": {"text": {"type": "string"}},
+                   "required": ["text"]}},
+ {"name": "list_items", "description": "List the user's current open items.",
+  "input_schema": {"type": "object", "properties": {}}},
+ {"name": "complete_item", "description": "Mark an item (and its subtasks) done.",
+  "input_schema": {"type": "object", "properties": {"id": {"type": "integer"}},
+                   "required": ["id"]}},
+ {"name": "get_brief", "description": "Today's brief: priority counts, schedule, "
+  "and overdue commitments needing follow-up.",
+  "input_schema": {"type": "object", "properties": {}}},
+ {"name": "create_calendar_event", "description": "Create a real event on the "
+  "user's Google Calendar.",
+  "input_schema": {"type": "object", "properties": {
+      "title": {"type": "string"},
+      "start": {"type": "string", "description": "naive local ISO, e.g. 2026-08-14T17:30"},
+      "end": {"type": "string", "description": "naive local ISO; default +1h"},
+      "description": {"type": "string"}}, "required": ["title", "start"]}},
+ {"name": "list_calendar_events", "description": "Upcoming Google Calendar events.",
+  "input_schema": {"type": "object", "properties": {"days": {"type": "integer"}}}},
+ {"name": "check_email", "description": "Read the user's recent Gmail to find "
+  "action items, requests, and deadlines. Returns sender, subject, snippet. "
+  "After reading, use `capture` to turn action items into tasks/commitments.",
+  "input_schema": {"type": "object", "properties": {
+      "query": {"type": "string", "description": "Gmail search, default is:unread newer_than:7d"},
+      "max": {"type": "integer"}}}},
+ {"name": "draft_email", "description": "Create a DRAFT email/reply in the user's "
+  "Gmail for them to review and send. NEVER sends automatically.",
+  "input_schema": {"type": "object", "properties": {
+      "to": {"type": "string"}, "subject": {"type": "string"},
+      "body": {"type": "string"}}, "required": ["to", "subject", "body"]}},
+ {"name": "web_search", "description": "Search the live web for current info — "
+  "products, prices, reviews, places, facts. Returns title, url, snippet for the "
+  "top results. Use this first for any 'find / compare / recommend' request.",
+  "input_schema": {"type": "object", "properties": {
+      "query": {"type": "string"}, "count": {"type": "integer"}},
+      "required": ["query"]}},
+ {"name": "web_read", "description": "Open a URL from web_search and read its main "
+  "text to check specs, details, or reviews before recommending.",
+  "input_schema": {"type": "object", "properties": {"url": {"type": "string"}},
+      "required": ["url"]}},
+ {"name": "propose_purchase", "description": "Propose a product for the user to BUY, "
+  "after researching it. IMPORTANT: this never pays or checks out — approving only "
+  "saves the decision and opens the store link so the USER completes payment. Use "
+  "after web_search/web_read. Always requires the user's approval.",
+  "input_schema": {"type": "object", "properties": {
+      "title": {"type": "string"}, "price": {"type": "string"},
+      "url": {"type": "string", "description": "direct product/checkout page"},
+      "reason": {"type": "string"}, "alternatives": {"type": "string"}},
+      "required": ["title", "url"]}},
+]
+
+class StatusIn(BaseModel): status: str
+
+def _plus_hour(s):
+    return (parse_dt(s) + dt.timedelta(hours=1)).isoformat() if parse_dt(s) else s
+
+def run_tool(name, inp, approved=False):
+    if not approved and needs_approval(name):
+        return {"pending": True, "tool": name, "input": inp,
+                "message": "Proposed — awaiting the user's approval."}
+    try:
+        if name == "capture":
+            parsed = extract_items(inp["text"])
+            return {"created": len(store_items(parsed, inp["text"])), "items": parsed}
+        if name == "list_items":
+            return list_items()
+        if name == "complete_item":
+            return update_item(inp["id"], StatusIn(status="done"))
+        if name == "get_brief":
+            return build_brief()
+        if name == "create_calendar_event":
+            if not gcal.is_configured():
+                return {"error": "Google Calendar not connected. Run authorize.py."}
+            start = inp["start"]; end = inp.get("end") or _plus_hour(start)
+            ev = gcal.create_event(inp["title"], start, end,
+                                   inp.get("description", "ATLAS"))
+            now = dt.datetime.now().isoformat()
+            with closing(db()) as c:
+                c.execute("INSERT INTO items(type,title,priority,deadline,"
+                          "scheduled_start,scheduled_end,google_event_id,created_at)"
+                          " VALUES('event',?,'important',?,?,?,?,?)",
+                          (inp["title"], start, start, end, ev["id"], now))
+                c.commit()
+            return {"created": ev}
+        if name == "list_calendar_events":
+            if not gcal.is_configured():
+                return {"error": "Google Calendar not connected."}
+            return gcal.list_events(inp.get("days", 7))
+        if name == "check_email":
+            if not gcal.is_configured():
+                return {"error": "Google account not connected."}
+            return gmail.list_recent(inp.get("query", "is:unread newer_than:7d"),
+                                     inp.get("max", 8))
+        if name == "draft_email":
+            if not gcal.is_configured():
+                return {"error": "Google account not connected."}
+            return gmail.create_draft(inp["to"], inp["subject"], inp["body"])
+        if name == "web_search":
+            return web.search(inp["query"], inp.get("count", 6))
+        if name == "web_read":
+            return {"url": inp["url"], "text": web.read(inp["url"])}
+        if name == "propose_purchase":
+            now = dt.datetime.now().isoformat()
+            with closing(db()) as c:
+                c.execute("INSERT INTO items(type,title,priority,status,link,"
+                          "source_text,created_at) VALUES('purchase',?,'important',"
+                          "'open',?,?,?)",
+                          (inp["title"], inp.get("url"), inp.get("reason", ""), now))
+                c.commit()
+            return {"saved": inp["title"], "open_url": inp.get("url"),
+                    "note": "Saved to your purchases. Opening the store so YOU can "
+                            "complete payment — ATLAS does not pay or check out."}
+        return {"error": f"unknown tool {name}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+CHAT_SYS = """You are ATLAS, {user}'s personal AI manager and chief-of-staff. \
+Be warm, concise, and proactive — a real assistant, not a chatbot. Current \
+datetime: {now} ({tz}).
+
+Use your tools to ACTUALLY do things, don't just describe them:
+- Anything to plan/remember/get done -> `capture` (it decomposes & schedules).
+- A specific appointment at a specific time -> `create_calendar_event`.
+- Questions about today/priorities -> `get_brief`; about tasks -> `list_items`;
+  about the calendar -> `list_calendar_events`.
+- "Check my email / any action items?" -> `check_email`, then `capture` real
+  action items and deadlines you find.
+- Asked to reply/email someone -> `draft_email` (creates a DRAFT only; tell the
+  user to review and send it — you never send mail yourself).
+- "Find / compare / recommend / what's the best..." → `web_search`, then
+  `web_read` on the 2-3 most promising results to check details, then give ONE
+  clear recommendation with a short reason and the key alternatives. Offer to
+  save it as a task or calendar event if useful.
+- "Buy / order / get me..." → research first (web_search/web_read), then
+  `propose_purchase` with your best pick. NEVER say you bought or ordered it —
+  you cannot pay. Approving only opens the store for the user to check out
+  themselves. Make that clear.
+
+You are spoken to by VOICE and your replies are read aloud, so keep them short,
+natural, and conversational — no markdown, bullet symbols, or long lists. After
+acting, say plainly what you did. Resolve relative dates yourself."""
+
+class ChatIn(BaseModel): messages: list[dict]
+
+# ---- deploy helpers -------------------------------------------------------
+def materialize_google_files():
+    """On a server there's no interactive OAuth. Instead, provide the JSON
+    contents via env vars (GOOGLE_CREDENTIALS_JSON / GOOGLE_TOKEN_JSON, generated
+    locally by authorize.py) and we write them to disk on boot."""
+    cj, tj = os.getenv("GOOGLE_CREDENTIALS_JSON"), os.getenv("GOOGLE_TOKEN_JSON")
+    try:
+        if cj and not gcal.CREDS.exists(): gcal.CREDS.write_text(cj)
+        if tj and not gcal.TOKEN.exists(): gcal.TOKEN.write_text(tj)
+    except Exception as e:
+        print("google file materialize failed:", e)
+
+# ---- api ------------------------------------------------------------------
+app = FastAPI(title="ATLAS")
+materialize_google_files()
+init_db()
+
+@app.on_event("startup")
+def _maybe_start_telegram():
+    """Optionally run the Telegram long-poller in-process so a single web
+    service serves both the app and the bot (set RUN_TELEGRAM_IN_WEB=1)."""
+    if os.getenv("RUN_TELEGRAM_IN_WEB") == "1" and os.getenv("TELEGRAM_BOT_TOKEN"):
+        import threading, telegram_bot
+        threading.Thread(target=telegram_bot.run, daemon=True).start()
+        print("Telegram bot thread started.")
+
+class CaptureIn(BaseModel): text: str
+
+@app.post("/api/capture")
+def capture(inp: CaptureIn):
+    if not inp.text.strip(): raise HTTPException(400, "empty note")
+    parsed = extract_items(inp.text)
+    return {"created": store_items(parsed, inp.text), "items": parsed}
+
+def run_agent(messages: list[dict]) -> dict:
+    """Shared agent loop used by the web chat AND the Telegram bot. Takes a
+    conversation (list of {role, content}) and returns {reply, actions, pending}.
+    Pending actions are proposed-but-not-executed (permission tiers)."""
+    import anthropic
+    client = anthropic.Anthropic()
+    sys = CHAT_SYS.format(user="Govind", tz=gcal.TZ,
+                          now=dt.datetime.now().isoformat(timespec="minutes"))
+    msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
+    actions = []
+    for _ in range(8):   # room for multi-step research (search -> read -> answer)
+        resp = client.messages.create(model=MODEL, max_tokens=1500, system=sys,
+                                       tools=TOOLS, messages=msgs)
+        if resp.stop_reason == "tool_use":
+            msgs.append({"role": "assistant",
+                         "content": [b.model_dump() for b in resp.content]})
+            results = []
+            for blk in resp.content:
+                if blk.type == "tool_use":
+                    out = run_tool(blk.name, blk.input)
+                    pend = isinstance(out, dict) and out.get("pending")
+                    actions.append({"tool": blk.name, "input": blk.input,
+                                    "pending": bool(pend)})
+                    content = ("AWAITING APPROVAL: you PROPOSED this action; it is "
+                               "NOT done yet. Tell the user you've prepared it and "
+                               "are waiting for their approval." if pend
+                               else json.dumps(out)[:4000])
+                    results.append({"type": "tool_result", "tool_use_id": blk.id,
+                                    "content": content})
+            msgs.append({"role": "user", "content": results})
+            continue
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        return {"reply": text, "actions": actions,
+                "pending": [a for a in actions if a["pending"]]}
+    return {"reply": "I took several steps but stopped to avoid looping. "
+            "Check your dashboard.", "actions": actions,
+            "pending": [a for a in actions if a["pending"]]}
+
+@app.post("/api/chat")
+def chat(inp: ChatIn):
+    return run_agent(inp.messages)
+
+@app.get("/api/items")
+def list_items(status: str = "open"):
+    with closing(db()) as c:
+        rows = c.execute("SELECT * FROM items WHERE status=? ORDER BY "
+                         "(deadline IS NULL), deadline, id", (status,)).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+@app.patch("/api/items/{item_id}")
+def update_item(item_id: int, s: StatusIn):
+    if s.status == "done":
+        _unsync([item_id])
+        with closing(db()) as c:
+            kids = [r["id"] for r in c.execute(
+                "SELECT id FROM items WHERE parent_id=?", (item_id,))]
+        if kids: _unsync(kids)
+    with closing(db()) as c:
+        c.execute("UPDATE items SET status=? WHERE id=? OR parent_id=?",
+                  (s.status, item_id, item_id))
+        c.commit()
+    schedule_unplanned()
+    return {"ok": True}
+
+@app.delete("/api/items/{item_id}")
+def delete_item(item_id: int):
+    _unsync([item_id])
+    with closing(db()) as c:
+        kids = [r["id"] for r in
+                c.execute("SELECT id FROM items WHERE parent_id=?", (item_id,))]
+        if kids: _unsync(kids)
+        c.execute("DELETE FROM items WHERE id=? OR parent_id=?", (item_id, item_id))
+        c.commit()
+    return {"ok": True}
+
+@app.post("/api/replan")
+def replan(): schedule_unplanned(); return {"ok": True}
+
+class ExecIn(BaseModel):
+    tool: str
+    input: dict
+
+@app.post("/api/execute")
+def execute(inp: ExecIn):
+    """Run a previously proposed action after the user approves it in the UI."""
+    return {"result": run_tool(inp.tool, inp.input, approved=True)}
+
+class SettingsIn(BaseModel):
+    settings: dict
+
+@app.get("/api/settings")
+def get_settings(): return load_settings()
+
+@app.put("/api/settings")
+def put_settings(s: SettingsIn):
+    cur = load_settings(); cur.update(s.settings); save_settings(cur); return cur
+
+@app.get("/api/brief")
+def brief(): return build_brief()
+
+@app.get("/")
+def index(): return FileResponse(FRONTEND / "index.html")
+
+# Served from root so the PWA service worker controls the whole origin ("/").
+@app.get("/sw.js")
+def service_worker():
+    return FileResponse(FRONTEND / "sw.js", media_type="application/javascript",
+                        headers={"Service-Worker-Allowed": "/",
+                                 "Cache-Control": "no-cache"})
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    return FileResponse(FRONTEND / "manifest.webmanifest",
+                        media_type="application/manifest+json")
+
+if (FRONTEND / "index.html").exists():
+    app.mount("/static", StaticFiles(directory=FRONTEND), name="static")

@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ATLAS — Personal AI Manager</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#05060d">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ATLAS">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="icon" href="/static/favicon.png">
+<style>
+  :root{
+    --bg:#05060d;--card:rgba(16,22,42,.55);--line:rgba(120,170,255,.20);
+    --fg:#eaf0fb;--mut:#8ea3c9;--acc:#6ea8fe;--acc2:#b78bff;--cy:#59e6ff;
+    --crit:#ff5d7a;--imp:#ffb057;--rout:#54e6a5;
+    --mono:ui-monospace,"Cascadia Code",Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{font:15px/1.5 "Segoe UI",system-ui,sans-serif;color:var(--fg);background:var(--bg);
+       overflow-x:hidden}
+  .bgfx{position:fixed;inset:0;z-index:-2;background:
+     radial-gradient(1000px 600px at 12% -10%,#101a40 0%,transparent 60%),
+     radial-gradient(900px 700px at 100% 8%,#241640 0%,transparent 55%),#05060d}
+  .stars{position:fixed;inset:0;z-index:-1;opacity:.5;
+    background-image:radial-gradient(1.4px 1.4px at 20% 30%,#fff8,transparent),
+      radial-gradient(1.2px 1.2px at 70% 60%,#fff6,transparent),
+      radial-gradient(1px 1px at 40% 80%,#fff5,transparent),
+      radial-gradient(1.4px 1.4px at 85% 25%,#fff7,transparent);
+    animation:tw 6s ease-in-out infinite alternate}
+  @keyframes tw{to{opacity:.8}}
+
+  .wrap{max-width:1120px;margin:0 auto;padding:20px 20px 60px}
+  .topbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;position:relative}
+  .logo{font-weight:800;letter-spacing:.32em;font-size:22px;font-family:var(--mono);
+    background:linear-gradient(90deg,var(--acc),var(--cy),var(--acc2));-webkit-background-clip:text;
+    background-clip:text;color:transparent}
+  .badge{font-family:var(--mono);font-size:11.5px;letter-spacing:.04em;padding:4px 11px;
+    border-radius:8px;border:1px solid var(--line);color:var(--mut);background:rgba(120,170,255,.05)}
+  .badge.on{color:var(--rout);border-color:rgba(84,230,165,.45);box-shadow:0 0 14px rgba(84,230,165,.25)}
+  .badge.btn{cursor:pointer}.badge.btn:hover{border-color:var(--cy);color:var(--fg)}
+
+  /* HERO / 3D stage */
+  .hero{position:relative;margin-top:14px;height:64vh;min-height:440px;border-radius:20px;
+    overflow:hidden;border:1px solid var(--line);
+    box-shadow:0 30px 80px rgba(0,0,0,.6),inset 0 0 60px rgba(30,60,140,.15)}
+  #scene{position:absolute;inset:0}
+  /* HUD corner brackets */
+  .hero::before,.hero::after{content:"";position:absolute;width:34px;height:34px;pointer-events:none;
+    border:2px solid rgba(120,180,255,.5)}
+  .hero::before{top:12px;left:12px;border-right:0;border-bottom:0}
+  .hero::after{bottom:12px;right:12px;border-left:0;border-top:0}
+
+  .hud{position:absolute;pointer-events:none}
+  .hud .bubble{pointer-events:auto}
+  .bubble{position:absolute;left:50%;top:18px;transform:translateX(-50%);max-width:min(560px,86%);
+    text-align:center;padding:12px 18px;border-radius:14px;background:rgba(8,14,30,.55);
+    border:1px solid var(--line);backdrop-filter:blur(8px);font-size:15.5px;min-height:22px}
+  .bubble .caret{display:inline-block;width:8px;height:1em;vertical-align:-2px;background:var(--cy);
+    margin-left:2px;animation:bk 1s steps(2) infinite}
+  @keyframes bk{50%{opacity:0}}
+
+  .statustext{position:absolute;left:50%;bottom:150px;transform:translateX(-50%);
+    font-family:var(--mono);font-size:12px;letter-spacing:.2em;color:var(--cy);text-transform:uppercase;
+    text-shadow:0 0 12px rgba(89,230,255,.6);height:16px}
+
+  .controls{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);
+    display:flex;flex-direction:column;align-items:center;gap:10px;pointer-events:auto}
+  .micbtn{width:74px;height:74px;border:0;border-radius:50%;cursor:pointer;font-size:28px;color:#04122e;
+    background:radial-gradient(circle at 30% 30%,#9cc4ff,var(--acc));
+    box-shadow:0 0 34px rgba(110,168,254,.6);transition:.2s}
+  .micbtn:active{transform:scale(.94)}
+  .micbtn.listening{background:radial-gradient(circle at 30% 30%,#ff9cb0,var(--crit));
+    box-shadow:0 0 40px rgba(255,93,122,.7);animation:pl 1.3s infinite}
+  .micbtn.thinking{background:radial-gradient(circle at 30% 30%,#9cf0ff,var(--cy))}
+  .micbtn.speaking{background:radial-gradient(circle at 30% 30%,#9cffd6,var(--rout))}
+  @keyframes pl{0%{box-shadow:0 0 0 0 rgba(255,93,122,.5)}70%{box-shadow:0 0 0 22px rgba(255,93,122,0)}
+    100%{box-shadow:0 0 0 0 rgba(255,93,122,0)}}
+  .chatbar{display:flex;gap:8px;width:min(440px,90vw)}
+  .chatbar input{flex:1;background:rgba(8,14,30,.75);border:1px solid var(--line);color:var(--fg);
+    border-radius:11px;padding:11px;font:inherit}
+  .chatbar button{background:linear-gradient(135deg,var(--acc),var(--acc2));border:0;color:#04122e;
+    font-weight:700;border-radius:11px;padding:0 16px;cursor:pointer}
+  .hf{font-family:var(--mono);font-size:11.5px;color:var(--mut);display:flex;align-items:center;gap:7px;
+    cursor:pointer}
+
+  .chat{position:absolute;left:16px;bottom:22px;width:280px;max-height:190px;overflow-y:auto;display:flex;
+    flex-direction:column;gap:7px;pointer-events:auto}
+  .msg{max-width:92%;padding:7px 11px;border-radius:12px;white-space:pre-wrap;font-size:13px;
+    backdrop-filter:blur(6px)}
+  .me{align-self:flex-end;background:linear-gradient(135deg,var(--acc),var(--acc2));color:#04122e}
+  .at{align-self:flex-start;background:rgba(12,20,40,.7);border:1px solid var(--line)}
+
+  #approvals{position:absolute;right:14px;top:60px;width:250px;display:flex;flex-direction:column;gap:10px;
+    pointer-events:auto}
+  .act{display:flex;align-items:flex-start;gap:10px;padding:11px 13px;border-radius:13px;
+    background:rgba(10,16,34,.82);border:1px solid var(--line);backdrop-filter:blur(8px);
+    box-shadow:0 12px 30px rgba(0,0,0,.5);animation:ai .45s cubic-bezier(.2,.9,.3,1.3)}
+  .act .ico{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;font-size:18px;
+    background:linear-gradient(135deg,var(--acc),var(--acc2));flex:none}
+  .act.done .ico{background:linear-gradient(135deg,#3ad29f,#28b98a)}
+  .act .t{font-size:13px;font-weight:600}.act .s{font-size:11px;color:var(--mut)}
+  @keyframes ai{0%{opacity:0;transform:translateX(24px) scale(.85)}100%{opacity:1;transform:none}}
+  @keyframes actout{to{opacity:0;transform:translateX(18px) scale(.9)}}
+  .mini{border:0;border-radius:8px;padding:6px 11px;font-size:12px;font-weight:700;cursor:pointer}
+  .mini.ok{background:linear-gradient(135deg,#54e6a5,#37c98d);color:#04231a}
+  .mini.no{background:transparent;border:1px solid var(--line);color:var(--mut)}
+
+  .permpop{position:absolute;top:34px;right:0;z-index:30;width:280px;padding:16px;border-radius:14px;
+    background:rgba(10,16,34,.97);border:1px solid var(--line);backdrop-filter:blur(12px);
+    box-shadow:0 20px 50px rgba(0,0,0,.6)}
+  .permpop h3{margin:0 0 12px;font-size:14px}
+  .permpop label{display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:var(--mut);margin-bottom:12px}
+  .permpop select{background:rgba(8,14,30,.9);border:1px solid var(--line);color:var(--fg);border-radius:9px;
+    padding:8px;font:inherit}
+
+  /* dashboard */
+  .grid{display:grid;grid-template-columns:1.3fr 1fr 1fr;gap:16px;margin-top:18px}
+  @media(max-width:860px){.grid{grid-template-columns:1fr}}
+  .panel{position:relative;background:var(--card);border:1px solid var(--line);border-radius:16px;
+    padding:18px;backdrop-filter:blur(10px);box-shadow:0 12px 34px rgba(0,0,0,.4)}
+  .panel::before{content:"";position:absolute;top:8px;left:8px;width:16px;height:16px;
+    border-top:2px solid rgba(120,180,255,.5);border-left:2px solid rgba(120,180,255,.5);border-radius:2px}
+  .panel h2{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.16em;
+    color:var(--cy);margin:0 0 12px}
+  .greet{font-size:20px;font-weight:700;margin:0 0 12px}
+  .counts{display:flex;gap:10px}.pill{flex:1;text-align:center;border-radius:11px;padding:12px 6px;
+    background:rgba(120,170,255,.05);border:1px solid var(--line)}
+  .pill b{display:block;font-size:24px}.c-critical{color:var(--crit)}.c-important{color:var(--imp)}
+  .c-routine{color:var(--rout)}
+  ul{list-style:none;margin:0;padding:0}
+  li{display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
+  li:first-child{border-top:0}.time{color:var(--cy);font-family:var(--mono);min-width:44px}
+  .dot{width:8px;height:8px;border-radius:50%;flex:none;box-shadow:0 0 8px currentColor}
+  .grow{flex:1}.warn{color:var(--imp)}.over{color:var(--crit)}.muted{color:var(--mut)}
+  .ghost{background:transparent;color:var(--mut);border:1px solid var(--line);padding:4px 10px;
+    border-radius:8px;font-size:12px;cursor:pointer}
+  .span2{grid-column:1 / -1}
+  .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--card);
+    border:1px solid var(--line);padding:10px 16px;border-radius:11px;opacity:0;transition:.2s;
+    backdrop-filter:blur(8px);z-index:50}
+  @media(max-width:640px){
+    .wrap{padding:calc(12px + env(safe-area-inset-top)) 12px calc(40px + env(safe-area-inset-bottom))}
+    .hero{height:56vh}.chat{display:none}#approvals{width:200px;top:52px}
+    .statustext{bottom:140px}
+  }
+</style>
+</head>
+<body>
+<div class="bgfx"></div><div class="stars"></div>
+
+<div class="wrap">
+  <div class="topbar">
+    <div class="logo">ATLAS</div>
+    <span class="badge" id="calbadge">google: …</span>
+    <button class="badge btn" id="bell" onclick="enableReminders()">🔔 Reminders off</button>
+    <button class="badge btn" onclick="togglePerms()">⚙ Permissions</button>
+    <button class="badge btn" id="install" style="display:none" onclick="installApp()">⬇ Install</button>
+    <div style="flex:1"></div>
+    <span class="badge">PLAN · EXECUTE · FOLLOW UP</span>
+    <div id="perms" class="permpop" hidden>
+      <h3>What can ATLAS do on its own?</h3>
+      <label>Create calendar events
+        <select id="permCal"><option value="ask">Ask me first</option>
+          <option value="auto">Do it automatically</option></select></label>
+      <label>Draft emails
+        <select id="permMail"><option value="ask">Ask me first</option>
+          <option value="auto">Do it automatically</option></select></label>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="mini ok" onclick="savePerms()">Save</button>
+        <button class="mini no" onclick="togglePerms()">Close</button></div>
+      <hr style="border:0;border-top:1px solid var(--line);margin:14px 0">
+      <label>3D avatar — paste a rigged .glb URL (e.g. Ready Player Me), or blank for the holo-core
+        <input id="avatarUrl" placeholder="https://models.readyplayer.me/xxxx.glb"
+          style="background:rgba(8,14,30,.9);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px;font:inherit"></label>
+      <div style="display:flex;gap:8px">
+        <button class="mini ok" onclick="loadAvatar()">Load avatar</button>
+        <button class="mini no" onclick="resetAvatar()">Holo-core</button></div>
+    </div>
+  </div>
+
+  <div class="hero">
+    <div id="scene"></div>
+    <div class="bubble"><span id="bubbletext"></span><span class="caret" id="caret"></span></div>
+    <div class="statustext" id="statustext"></div>
+    <div class="chat" id="chat"></div>
+    <div id="approvals"></div>
+    <div class="controls">
+      <button id="mic" class="micbtn" onclick="toggleMic()" title="Talk to ATLAS">🎤</button>
+      <label class="hf"><input type="checkbox" id="handsfree" onchange="handsfree=this.checked">
+        Hands-free conversation</label>
+      <div class="chatbar">
+        <input id="msg" placeholder="…or type a command" onkeydown="if(event.key==='Enter')typed()">
+        <button onclick="typed()">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="panel"><p class="greet" id="greet">…</p><div class="counts" id="counts"></div></div>
+    <div class="panel"><h2>Today's schedule</h2><ul id="schedule"></ul></div>
+    <div class="panel"><h2>⚠ Needs your attention</h2><ul id="attention"></ul></div>
+    <div class="panel span2"><h2>Open items
+      <button class="ghost" style="float:right" onclick="replan()">Re-plan</button></h2>
+      <ul id="items"></ul></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="/static/vendor/three.min.js"></script>
+<script src="/static/vendor/GLTFLoader.js"></script>
+<script src="/static/scene.js"></script>
+<script>
+const $=s=>document.querySelector(s), api=(u,o)=>fetch(u,o).then(r=>r.json());
+const DOT={critical:'var(--crit)',important:'var(--imp)',routine:'var(--rout)'};
+let history=[];
+function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function toast(t){const e=$('#toast');e.textContent=t;e.style.opacity=1;setTimeout(()=>e.style.opacity=0,1800);}
+function bubbleMsg(cls,txt){const d=document.createElement('div');d.className='msg '+cls;
+  d.textContent=txt;$('#chat').appendChild(d);$('#chat').scrollTop=1e9;return d;}
+
+/* ===== speaking amplitude pump -> drives the 3D core ===== */
+let pump=null;
+function startPump(){ stopPump(); pump=setInterval(()=>window.ATLAS3D&&ATLAS3D.setSpeakAmp(0.3+Math.random()*0.7),90); }
+function stopPump(){ if(pump)clearInterval(pump); pump=null; window.ATLAS3D&&ATLAS3D.setSpeakAmp(0); }
+
+function setState(st){ // idle | listening | thinking | speaking
+  window.ATLAS3D&&ATLAS3D.setState(st);
+  $('#mic').className='micbtn '+(st==='idle'?'':st);
+  $('#statustext').textContent={idle:'',listening:'Listening',thinking:'Thinking',speaking:'Speaking'}[st];
+  st==='speaking'?startPump():stopPump();
+}
+function saySoft(text){ const el=$('#bubbletext'); el.textContent=''; let i=0;
+  clearInterval(saySoft._t);
+  saySoft._t=setInterval(()=>{ el.textContent+=text[i++]||''; if(i>=text.length)clearInterval(saySoft._t); },24);
+}
+
+/* ===== activity holograms (3D) ===== */
+const ACT={
+  capture:{i:'🗂️',t:'Planning tasks'}, create_calendar_event:{i:'📅',t:'Calendar'},
+  list_calendar_events:{i:'📅',t:'Reading calendar'}, check_email:{i:'📧',t:'Scanning inbox'},
+  draft_email:{i:'✉️',t:'Drafting reply'}, get_brief:{i:'📋',t:'Reviewing day'},
+  complete_item:{i:'✅',t:'Marking done'}, list_items:{i:'🗂️',t:'Checking tasks'},
+  web_search:{i:'🔎',t:'Searching web'}, web_read:{i:'📄',t:'Reading page'},
+  propose_purchase:{i:'🛒',t:'Preparing buy'}, replan:{i:'🧭',t:'Re-planning'},
+};
+function showActivity(tool){const a=ACT[tool]||{i:'⚙️',t:tool};
+  window.ATLAS3D&&ATLAS3D.spawnActivity(a.i,a.t);}
+
+/* ===== approval cards (permission tiers) ===== */
+function actDesc(tool,inp){
+  if(tool==='create_calendar_event')return `${inp.title||''} · ${(inp.start||'').replace('T',' ')}`;
+  if(tool==='draft_email')return `To ${inp.to||'?'} · ${inp.subject||''}`;
+  if(tool==='propose_purchase')return `${inp.title||''}${inp.price?' · '+inp.price:''} — ATLAS won't pay; opens the store`;
+  return JSON.stringify(inp);
+}
+function approvalCard(a){
+  const el=document.createElement('div');el.className='act';const m=ACT[a.tool]||{i:'⚠️',t:a.tool};
+  el.innerHTML=`<div class="ico">${m.i}</div><div style="flex:1">
+    <div class="t">Approve · ${m.t}</div><div class="s">${esc(actDesc(a.tool,a.input||{}))}</div>
+    <div style="margin-top:8px;display:flex;gap:6px">
+      <button class="mini ok">Approve</button><button class="mini no">Cancel</button></div></div>`;
+  el.querySelector('.ok').onclick=async()=>{ el.querySelector('.s').textContent='Working…';
+    const r=await api('/api/execute',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({tool:a.tool,input:a.input})});
+    if(r&&r.result&&r.result.open_url)window.open(r.result.open_url,'_blank','noopener');
+    el.classList.add('done');el.querySelector('.ico').textContent='✓';el.querySelector('.t').textContent='Done';
+    el.querySelectorAll('button').forEach(b=>b.remove());showActivity(a.tool);refresh();
+    setTimeout(()=>{el.style.animation='actout .4s forwards';setTimeout(()=>el.remove(),400);},1500);};
+  el.querySelector('.no').onclick=()=>{el.style.animation='actout .4s forwards';setTimeout(()=>el.remove(),400);};
+  $('#approvals').prepend(el);
+}
+
+/* ===== permissions ===== */
+function togglePerms(){const p=$('#perms');p.hidden=!p.hidden;if(!p.hidden)loadPerms();}
+async function loadPerms(){const s=await api('/api/settings');
+  $('#permCal').value=s.create_calendar_event||'ask';$('#permMail').value=s.draft_email||'ask';
+  if(s.avatar_url!==undefined)$('#avatarUrl').value=s.avatar_url||'';}
+async function savePerms(){await api('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({settings:{create_calendar_event:$('#permCal').value,draft_email:$('#permMail').value}})});
+  toast('Permissions saved');togglePerms();}
+async function saveAvatarUrl(url){await api('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({settings:{avatar_url:url}})});}
+function loadAvatar(){ const url=$('#avatarUrl').value.trim();
+  if(!url){toast('Paste a .glb avatar URL first');return;}
+  if(!window.ATLAS3D||!ATLAS3D.loadAvatar){toast('3D not ready');return;}
+  toast('Loading avatar…'); window._avatarReq=true;
+  ATLAS3D.loadAvatar(url,ok=>toast(ok?'Avatar loaded ✨':'Load failed — check the URL / CORS'));
+  saveAvatarUrl(url);}
+function resetAvatar(){ window.ATLAS3D&&ATLAS3D.resetAvatar&&ATLAS3D.resetAvatar();
+  $('#avatarUrl').value='';saveAvatarUrl('');window._avatarReq=false;toast('Back to the holo-core');}
+
+/* ===== proactive reminders ===== */
+let notifOn=false;const seenAttention=new Set();let primed=false;
+async function enableReminders(){ if(!('Notification'in window)){toast('Notifications not supported');return;}
+  const p=await Notification.requestPermission();notifOn=(p==='granted');
+  $('#bell').textContent=notifOn?'🔔 Reminders on':'🔔 Reminders blocked';$('#bell').classList.toggle('on',notifOn);
+  if(notifOn)toast('ATLAS will now nudge you about overdue & upcoming items');}
+function remind(t){if(notifOn){try{new Notification('ATLAS · reminder',{body:t});}catch(_){}}}
+async function pollReminders(){ try{const b=await api('/api/brief');(b.attention||[]).forEach(a=>{
+  if(!seenAttention.has(a)){seenAttention.add(a);
+    if(primed){remind(a);toast('🔔 '+a);
+      if(notifOn&&!speaking&&!listening&&!processing){speaking=true;setState('speaking');
+        const u=new SpeechSynthesisUtterance('Reminder. '+a);u.lang='en-IN';
+        u.onend=()=>{speaking=false;setState('idle');};try{speechSynthesis.speak(u);}catch(_){speaking=false;}}}}});
+  primed=true;}catch(_){}}
+
+/* ===== VOICE ===== */
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+let rec=null,handsfree=false,listening=false,speaking=false,processing=false;
+function initRec(){ if(!SR){$('#statustext').textContent='Voice needs Chrome/Edge';return null;}
+  const r=new SR();r.lang='en-IN';r.interimResults=true;r.continuous=false;
+  r.onstart=()=>{listening=true;setState('listening');};
+  r.onresult=e=>{let fin='',intm='';for(let i=e.resultIndex;i<e.results.length;i++){
+    const t=e.results[i][0].transcript;e.results[i].isFinal?fin+=t:intm+=t;}
+    if(intm)$('#statustext').textContent='“ '+intm+' ”';if(fin.trim())handleUtterance(fin.trim());};
+  r.onerror=e=>{listening=false;setState('idle');if(e.error==='not-allowed')$('#statustext').textContent='Allow microphone';};
+  r.onend=()=>{listening=false;if(speaking||processing)return;handsfree?startListen():setState('idle');};
+  return r;}
+function startListen(){if(!rec)rec=initRec();if(rec&&!listening){try{rec.start();}catch(_){}}}
+function stopAll(){handsfree=false;if(rec&&listening)rec.stop();if(window.speechSynthesis)speechSynthesis.cancel();
+  speaking=false;setState('idle');}
+function toggleMic(){ if(listening||speaking){$('#handsfree').checked=false;stopAll();}
+  else{if($('#handsfree').checked)handsfree=true;startListen();}}
+function speak(text){ if(!('speechSynthesis'in window)||!text){afterSpeak();return;}
+  speaking=true;setState('speaking');
+  const u=new SpeechSynthesisUtterance(text);u.lang='en-IN';u.rate=1.05;u.pitch=1.05;
+  u.onend=()=>{speaking=false;afterSpeak();};u.onerror=()=>{speaking=false;afterSpeak();};
+  speechSynthesis.cancel();speechSynthesis.speak(u);}
+function afterSpeak(){handsfree?startListen():setState('idle');}
+
+async function handleUtterance(text){ if(!text||processing)return;
+  processing=true;if(rec&&listening)rec.stop();
+  bubbleMsg('me',text);history.push({role:'user',content:text});setState('thinking');saySoft('Working on it…');
+  try{ const r=await api('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({messages:history})});
+    (r.actions||[]).forEach((a,idx)=>{if(a.pending)approvalCard(a);else setTimeout(()=>showActivity(a.tool),idx*400);});
+    bubbleMsg('at',r.reply||'(no reply)');history.push({role:'assistant',content:r.reply||''});
+    await refresh();processing=false;saySoft(r.reply||'');speak(r.reply);
+  }catch(e){bubbleMsg('at','Error — is the API key set?');saySoft('Something went wrong.');processing=false;setState('idle');}}
+function typed(){const i=$('#msg'),t=i.value.trim();if(!t)return;i.value='';handleUtterance(t);}
+
+/* ===== dashboard ===== */
+async function loadBrief(){const b=await api('/api/brief');$('#greet').textContent=b.greeting;
+  if(b.avatar_url&&!window._avatarReq&&window.ATLAS3D&&ATLAS3D.loadAvatar){
+    window._avatarReq=true; ATLAS3D.loadAvatar(b.avatar_url,ok=>ok&&toast('Avatar loaded ✨'));}
+  const bd=$('#calbadge');bd.className='badge '+(b.calendar_connected?'on':'');
+  bd.textContent=b.calendar_connected?'google: connected':'google: not connected';
+  $('#counts').innerHTML=['critical','important','routine'].map(k=>
+    `<div class="pill"><b class="c-${k}">${b.counts[k]||0}</b>${k}</div>`).join('');
+  $('#schedule').innerHTML=b.schedule.length?b.schedule.map(s=>
+    `<li><span class="time">${s.time}</span><span class="dot" style="color:${DOT[s.priority]};background:${DOT[s.priority]}"></span><span class="grow">${esc(s.title)}</span></li>`).join('')
+    :'<li class="muted">Nothing scheduled today.</li>';
+  $('#attention').innerHTML=b.attention.length?b.attention.map(a=>
+    `<li><span class="${a.includes('overdue')?'over':'warn'}">${esc(a)}</span></li>`).join('')
+    :'<li class="muted">All clear. 🎉</li>';}
+async function loadItems(){const items=await api('/api/items?status=open');const top=items.filter(i=>!i.parent_id);
+  $('#items').innerHTML=top.length?top.map(i=>{const kids=items.filter(k=>k.parent_id===i.id);
+    const meta=[i.type,i.deadline?('due '+i.deadline.slice(0,16).replace('T',' ')):null,i.google_event_id?'📅':null].filter(Boolean).join(' · ');
+    const icon=i.type==='purchase'?'🛒 ':'';
+    const open=i.link?`<a class="ghost" href="${esc(i.link)}" target="_blank" rel="noopener" style="text-decoration:none">Open ↗</a>`:'';
+    const sub=kids.map(k=>`<li style="padding-left:18px"><span class="dot" style="color:${DOT[k.priority]};background:${DOT[k.priority]}"></span><span class="grow">${esc(k.title)}${k.google_event_id?' 📅':''}</span><button class="ghost" onclick="done(${k.id})">done</button></li>`).join('');
+    return `<li><span class="dot" style="color:${DOT[i.priority]};background:${DOT[i.priority]}"></span>
+      <span class="grow">${icon}${esc(i.title)}<div class="muted" style="font-size:12px">${esc(meta)}</div></span>
+      ${open}<button class="ghost" onclick="done(${i.id})">done</button>
+      <button class="ghost" onclick="del(${i.id})">✕</button></li>${sub}`;
+  }).join(''):'<li class="muted">No open items — talk to ATLAS above.</li>';}
+async function done(id){await api('/api/items/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'done'})});showActivity('complete_item');toast('Marked done');refresh();}
+async function del(id){await api('/api/items/'+id,{method:'DELETE'});refresh();}
+async function replan(){await api('/api/replan',{method:'POST'});showActivity('replan');toast('Re-planned');refresh();}
+async function refresh(){await Promise.all([loadBrief(),loadItems()]);}
+
+/* ===== boot ===== */
+window.addEventListener('load',()=>{
+  try{ window.ATLAS3D&&ATLAS3D.init($('#scene')); }catch(e){ console.error('3D init failed',e); }
+  setState('speaking');
+  saySoft("Hi Govind — I'm ATLAS. Tap the mic and tell me what's on your mind, and I'll plan it, schedule it, and follow up.");
+  setTimeout(()=>{speaking=false;setState('idle');},4600);
+  refresh().then(pollReminders); setInterval(pollReminders,60000);
+});
+
+/* ===== PWA ===== */
+if('serviceWorker'in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}));}
+let deferredPrompt=null;
+window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredPrompt=e;const b=$('#install');if(b)b.style.display='inline-block';});
+async function installApp(){ if(!deferredPrompt){toast('Use browser menu → Add to Home screen');return;}
+  deferredPrompt.prompt();await deferredPrompt.userChoice;deferredPrompt=null;$('#install').style.display='none';}
+window.addEventListener('appinstalled',()=>{const b=$('#install');if(b)b.style.display='none';toast('ATLAS installed 🎉');});
+</script>
+</body>
+</html>
