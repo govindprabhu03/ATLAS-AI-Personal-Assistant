@@ -72,7 +72,25 @@ CREATE TABLE IF NOT EXISTS items(
   scheduled_end TEXT,
   google_event_id TEXT,                     -- set when synced to Google Calendar
   link TEXT,                                -- store/checkout URL for purchases
+  recurring_id INTEGER,                     -- template this occurrence came from
   source_text TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL DEFAULT 'local',
+  content TEXT NOT NULL,                     -- a durable fact/preference about the user
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recurring(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL DEFAULT 'local',
+  title TEXT NOT NULL,
+  type TEXT DEFAULT 'task',                  -- task | event
+  priority TEXT DEFAULT 'routine',
+  rule TEXT NOT NULL,                        -- daily | weekly:MON,WED | monthly:15
+  at_time TEXT,                              -- HH:MM or NULL
+  active INTEGER DEFAULT 1,
   created_at TEXT NOT NULL
 );
 """
@@ -88,6 +106,8 @@ def init_db():
             c.execute("ALTER TABLE items ADD COLUMN link TEXT")
         if "user_id" not in cols:
             c.execute("ALTER TABLE items ADD COLUMN user_id TEXT NOT NULL DEFAULT 'local'")
+        if "recurring_id" not in cols:
+            c.execute("ALTER TABLE items ADD COLUMN recurring_id INTEGER")
         c.commit()
 
 def row_to_dict(r): return {k: r[k] for k in r.keys()}
@@ -289,8 +309,107 @@ def remove_item(uid, item_id):
         c.commit()
     return {"ok": True}
 
+# ---- long-term memory -----------------------------------------------------
+def add_memory(uid, content):
+    with closing(db()) as c:
+        c.execute("INSERT INTO memory(user_id,content,created_at) VALUES(?,?,?)",
+                  (uid, content.strip(), dt.datetime.now().isoformat()))
+        c.commit()
+    return {"remembered": content.strip()}
+
+def list_memory(uid):
+    with closing(db()) as c:
+        return [row_to_dict(r) for r in c.execute(
+            "SELECT * FROM memory WHERE user_id=? ORDER BY id DESC", (uid,))]
+
+def forget_memory(uid, needle):
+    with closing(db()) as c:
+        if str(needle).isdigit():
+            c.execute("DELETE FROM memory WHERE user_id=? AND id=?", (uid, int(needle)))
+        else:
+            c.execute("DELETE FROM memory WHERE user_id=? AND content LIKE ?",
+                      (uid, f"%{needle}%"))
+        c.commit()
+    return {"forgot": needle}
+
+def memory_block(uid):
+    facts = list_memory(uid)
+    return "\n".join("- " + f["content"] for f in facts[:60]) or "(nothing saved yet)"
+
+# ---- recurring tasks/events ----------------------------------------------
+WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+
+def build_rule(freq, days=None, day_of_month=None):
+    if freq == "weekly" and days:
+        return "weekly:" + ",".join(d.upper()[:3] for d in days)
+    if freq == "monthly" and day_of_month:
+        return f"monthly:{int(day_of_month)}"
+    return "daily"
+
+def _rule_matches(rule, d):
+    if rule == "daily": return True
+    if rule.startswith("weekly:"):
+        return WEEKDAYS[d.weekday()] in rule.split(":", 1)[1].split(",")
+    if rule.startswith("monthly:"):
+        try: return d.day == int(rule.split(":", 1)[1])
+        except ValueError: return False
+    return False
+
+def add_recurring(uid, title, freq, days=None, day_of_month=None, at_time=None,
+                  type="task", priority="routine"):
+    rule = build_rule(freq, days, day_of_month)
+    with closing(db()) as c:
+        c.execute("INSERT INTO recurring(user_id,title,type,priority,rule,at_time,"
+                  "created_at) VALUES(?,?,?,?,?,?,?)",
+                  (uid, title, "event" if at_time else type, priority, rule,
+                   at_time, dt.datetime.now().isoformat()))
+        c.commit()
+    spawn_recurring(uid)
+    return {"added_recurring": title, "rule": rule, "at_time": at_time}
+
+def list_recurring(uid):
+    with closing(db()) as c:
+        return [row_to_dict(r) for r in c.execute(
+            "SELECT * FROM recurring WHERE user_id=? AND active=1 ORDER BY id DESC", (uid,))]
+
+def remove_recurring(uid, rid):
+    with closing(db()) as c:
+        c.execute("UPDATE recurring SET active=0 WHERE user_id=? AND id=?", (uid, int(rid)))
+        c.commit()
+    return {"removed_recurring": rid}
+
+def spawn_recurring(uid, horizon=7):
+    """Materialize concrete items for each active template across the next
+    `horizon` days. Idempotent (dedup on recurring_id + date)."""
+    today = dt.date.today(); now = dt.datetime.now().isoformat()
+    with closing(db()) as c:
+        temps = c.execute("SELECT * FROM recurring WHERE user_id=? AND active=1",
+                          (uid,)).fetchall()
+        for t in temps:
+            for i in range(horizon + 1):
+                d = today + dt.timedelta(days=i)
+                if not _rule_matches(t["rule"], d): continue
+                exists = c.execute("SELECT 1 FROM items WHERE user_id=? AND recurring_id=? "
+                                   "AND substr(deadline,1,10)=?",
+                                   (uid, t["id"], d.isoformat())).fetchone()
+                if exists: continue
+                if t["at_time"]:
+                    ss = f"{d.isoformat()}T{t['at_time']}"
+                    se = (parse_dt(ss) + dt.timedelta(hours=1)).isoformat()
+                    c.execute("INSERT INTO items(user_id,type,title,priority,deadline,"
+                              "scheduled_start,scheduled_end,recurring_id,created_at) "
+                              "VALUES(?,'event',?,?,?,?,?,?,?)",
+                              (uid, t["title"], t["priority"], ss, ss, se, t["id"], now))
+                else:
+                    c.execute("INSERT INTO items(user_id,type,title,priority,deadline,"
+                              "recurring_id,created_at) VALUES(?,'task',?,?,?,?,?)",
+                              (uid, t["title"], t["priority"], d.isoformat(), t["id"], now))
+        c.commit()
+    schedule_unplanned(uid)
+
 # ---- daily brief ----------------------------------------------------------
 def build_brief(uid="local", name="there"):
+    spawn_recurring(uid)                       # keep recurring items materialized
     now = dt.datetime.now(); today = now.date()
     tomorrow = today + dt.timedelta(days=1)
     with closing(db()) as c:
@@ -379,6 +498,26 @@ TOOLS = [
       "url": {"type": "string", "description": "direct product/checkout page"},
       "reason": {"type": "string"}, "alternatives": {"type": "string"}},
       "required": ["title", "url"]}},
+ {"name": "remember", "description": "Save a durable fact or preference about the "
+  "user to long-term memory (persists across all future conversations). Use for "
+  "people (manager, teammates, family), habits, preferences, likes/dislikes, "
+  "home/work details, ongoing goals — anything worth recalling later.",
+  "input_schema": {"type": "object", "properties": {"fact": {"type": "string"}},
+      "required": ["fact"]}},
+ {"name": "add_recurring", "description": "Create a recurring task or event that "
+  "repeats automatically (e.g. daily standup, gym Mon/Wed/Fri, rent on the 1st). "
+  "Occurrences are generated onto the user's schedule.",
+  "input_schema": {"type": "object", "properties": {
+      "title": {"type": "string"},
+      "freq": {"type": "string", "description": "daily | weekly | monthly"},
+      "days": {"type": "array", "items": {"type": "string"},
+               "description": "for weekly: e.g. [MON,WED,FRI]"},
+      "day_of_month": {"type": "integer", "description": "for monthly: 1-31"},
+      "time": {"type": "string", "description": "HH:MM 24h; makes it a timed event"},
+      "priority": {"type": "string", "description": "critical|important|routine"}},
+      "required": ["title", "freq"]}},
+ {"name": "list_recurring", "description": "List the user's active recurring items.",
+  "input_schema": {"type": "object", "properties": {}}},
 ]
 
 class StatusIn(BaseModel): status: str
@@ -442,6 +581,14 @@ def run_tool(name, inp, uid="local", approved=False):
             return {"saved": inp["title"], "open_url": inp.get("url"),
                     "note": "Saved to your purchases. Opening the store so YOU can "
                             "complete payment — ATLAS does not pay or check out."}
+        if name == "remember":
+            return add_memory(uid, inp["fact"])
+        if name == "add_recurring":
+            return add_recurring(uid, inp["title"], inp["freq"], inp.get("days"),
+                                 inp.get("day_of_month"), inp.get("time"),
+                                 priority=inp.get("priority", "routine"))
+        if name == "list_recurring":
+            return list_recurring(uid)
         return {"error": f"unknown tool {name}"}
     except Exception as e:
         return {"error": str(e)}
@@ -450,7 +597,14 @@ CHAT_SYS = """You are ATLAS, {user}'s personal AI manager and chief-of-staff. \
 Be warm, concise, and proactive — a real assistant, not a chatbot. Current \
 datetime: {now} ({tz}).
 
+What you know about {user} (long-term memory — use it naturally, don't recite it):
+{memory}
+
 Use your tools to ACTUALLY do things, don't just describe them:
+- When {user} shares a durable fact or preference (their manager/teammates/family,
+  habits, likes/dislikes, home or work details, ongoing goals) -> `remember` it.
+- Anything that repeats ("every day/Monday/month", "daily", "each morning") ->
+  `add_recurring`.
 - Anything to plan/remember/get done -> `capture` (it decomposes & schedules).
 - A specific appointment at a specific time -> `create_calendar_event`.
 - Questions about today/priorities -> `get_brief`; about tasks -> `list_items`;
@@ -536,7 +690,7 @@ def run_agent(messages: list[dict], uid="local", name="there") -> dict:
         client = _genai()
     except Exception as e:
         return {"reply": friendly_ai_error(e), "actions": [], "pending": []}
-    sys = CHAT_SYS.format(user=name, tz=gcal.TZ,
+    sys = CHAT_SYS.format(user=name, tz=gcal.TZ, memory=memory_block(uid),
                           now=dt.datetime.now().isoformat(timespec="minutes"))
     cfg = types.GenerateContentConfig(system_instruction=sys, tools=_gemini_tools(),
                                       temperature=0.3)
@@ -622,6 +776,22 @@ def put_settings(s: SettingsIn, user=Depends(auth.current_user)):
 @app.get("/api/brief")
 def brief(user=Depends(auth.current_user)):
     return build_brief(user["id"], display_name(user))
+
+@app.get("/api/memory")
+def api_memory(user=Depends(auth.current_user)):
+    return list_memory(user["id"])
+
+@app.delete("/api/memory/{mid}")
+def api_forget(mid: int, user=Depends(auth.current_user)):
+    return forget_memory(user["id"], mid)
+
+@app.get("/api/recurring")
+def api_recurring(user=Depends(auth.current_user)):
+    return list_recurring(user["id"])
+
+@app.delete("/api/recurring/{rid}")
+def api_remove_recurring(rid: int, user=Depends(auth.current_user)):
+    return remove_recurring(user["id"], rid)
 
 @app.get("/")
 def index(): return FileResponse(FRONTEND / "index.html")

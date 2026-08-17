@@ -262,6 +262,8 @@
     <div class="panel span2"><h2>Open items
       <button class="ghost" style="float:right" onclick="replan()">Re-plan</button></h2>
       <ul id="items"></ul></div>
+    <div class="panel"><h2>🧠 ATLAS remembers</h2><ul id="memory"></ul></div>
+    <div class="panel"><h2>🔁 Recurring</h2><ul id="recurring"></ul></div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -325,6 +327,8 @@ const ACT={
   complete_item:{i:'✅',t:'Marking done'}, list_items:{i:'🗂️',t:'Checking tasks'},
   web_search:{i:'🔎',t:'Searching web'}, web_read:{i:'📄',t:'Reading page'},
   propose_purchase:{i:'🛒',t:'Preparing buy'}, replan:{i:'🧭',t:'Re-planning'},
+  remember:{i:'🧠',t:'Remembering'}, add_recurring:{i:'🔁',t:'Setting recurring'},
+  list_recurring:{i:'🔁',t:'Checking recurring'},
 };
 function showActivity(tool){const a=ACT[tool]||{i:'⚙️',t:tool};
   window.ATLAS3D&&ATLAS3D.spawnActivity(a.i,a.t);}
@@ -450,7 +454,26 @@ async function loadItems(){const items=await api('/api/items?status=open');const
 async function done(id){await api('/api/items/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'done'})});showActivity('complete_item');toast('Marked done');refresh();}
 async function del(id){await api('/api/items/'+id,{method:'DELETE'});refresh();}
 async function replan(){await api('/api/replan',{method:'POST'});showActivity('replan');toast('Re-planned');refresh();}
-async function refresh(){await Promise.all([loadBrief(),loadItems()]);}
+async function loadMemory(){
+  const m=await api('/api/memory');
+  $('#memory').innerHTML=m.length?m.map(x=>
+    `<li><span class="grow">${esc(x.content)}</span><button class="ghost" onclick="forget(${x.id})">forget</button></li>`).join('')
+    :'<li class="muted">Nothing yet — tell ATLAS about yourself.</li>';
+}
+async function loadRecurring(){
+  const r=await api('/api/recurring');
+  const human=x=>{const t=x.at_time?(' at '+x.at_time):'';
+    if(x.rule==='daily')return 'Daily'+t;
+    if(x.rule.startsWith('weekly:'))return x.rule.split(':')[1].replace(/,/g,'/')+t;
+    if(x.rule.startsWith('monthly:'))return 'Monthly (day '+x.rule.split(':')[1]+')'+t;
+    return x.rule;};
+  $('#recurring').innerHTML=r.length?r.map(x=>
+    `<li><span class="grow">${esc(x.title)}<div class="muted" style="font-size:12px">${esc(human(x))}</div></span><button class="ghost" onclick="removeRecurring(${x.id})">✕</button></li>`).join('')
+    :'<li class="muted">No recurring items. Say "gym every Mon/Wed/Fri".</li>';
+}
+async function forget(id){await api('/api/memory/'+id,{method:'DELETE'});toast('Forgotten');loadMemory();}
+async function removeRecurring(id){await api('/api/recurring/'+id,{method:'DELETE'});toast('Removed');refresh();}
+async function refresh(){await Promise.all([loadBrief(),loadItems(),loadMemory(),loadRecurring()]);}
 
 /* ===== boot ===== */
 let _appStarted=false;
