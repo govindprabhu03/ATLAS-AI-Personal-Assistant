@@ -54,11 +54,26 @@ class _Conn:
     def close(self): self.raw.close()
 
 
+def _pg_params(url):
+    """Parse a Postgres URI into psycopg kwargs WITHOUT tripping on special
+    characters in the password (Supabase passwords often contain @ / : ). We
+    split on the LAST '@' (host has none) and the FIRST ':' of the userinfo, so
+    the raw password can be pasted un-encoded."""
+    rest = url.split("://", 1)[1]
+    rest = rest.split("?", 1)[0]                 # drop any query string
+    userinfo, hostpart = rest.rsplit("@", 1)
+    user, _, password = userinfo.partition(":")
+    hostport, _, dbname = hostpart.partition("/")
+    host, _, port = hostport.partition(":")
+    return {"host": host, "port": port or "5432", "user": user,
+            "password": password, "dbname": dbname or "postgres",
+            "sslmode": "require"}
+
 def connect() -> _Conn:
     if IS_PG:
         import psycopg
         from psycopg.rows import dict_row
-        return _Conn(psycopg.connect(DATABASE_URL, row_factory=dict_row), True)
+        return _Conn(psycopg.connect(row_factory=dict_row, **_pg_params(DATABASE_URL)), True)
     import sqlite3
     raw = sqlite3.connect(DB_PATH); raw.row_factory = sqlite3.Row
     return _Conn(raw, False)
