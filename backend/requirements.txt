@@ -1,6 +1,6 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
-anthropic>=0.40
+google-genai>=0.3
 pydantic>=2.7
 google-api-python-client>=2.130
 google-auth-oauthlib>=1.2

@@ -31,7 +31,7 @@ import auth
 
 # ---- config ---------------------------------------------------------------
 DB_PATH = os.getenv("ATLAS_DB", str(Path(__file__).parent / "atlas.db"))
-MODEL = os.getenv("ATLAS_MODEL", "claude-sonnet-5")
+MODEL = os.getenv("ATLAS_MODEL", "gemini-2.5-flash")   # Google Gemini (free tier)
 WORK_START, WORK_END = 9, 21
 BLOCK_MINUTES = 60
 FRONTEND = Path(__file__).parent.parent / "frontend"
@@ -110,16 +110,52 @@ Each item:
   subtasks: ONLY for "goal" — 3-7 concrete step titles. Else [].
 Split compound notes into multiple items."""
 
-def call_claude(system, user, max_tokens=1500):
-    import anthropic
-    m = anthropic.Anthropic().messages.create(
-        model=MODEL, max_tokens=max_tokens, system=system,
-        messages=[{"role": "user", "content": user}])
-    return "".join(b.text for b in m.content if b.type == "text")
+# ---- LLM engine: Google Gemini (free tier) --------------------------------
+def _genai():
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not set")
+    from google import genai
+    return genai.Client(api_key=key)
+
+_GTYPE = {"string": "STRING", "integer": "INTEGER", "number": "NUMBER",
+          "boolean": "BOOLEAN", "object": "OBJECT", "array": "ARRAY"}
+
+def _to_schema(js):
+    """Convert a JSON-schema dict (our tool format) to a Gemini types.Schema."""
+    from google.genai import types
+    kw = {"type": _GTYPE.get(js.get("type", "string"), "STRING")}
+    if js.get("description"): kw["description"] = js["description"]
+    if kw["type"] == "OBJECT":
+        props = js.get("properties") or {}
+        kw["properties"] = {k: _to_schema(v) for k, v in props.items()}
+        if js.get("required"): kw["required"] = js["required"]
+    if kw["type"] == "ARRAY" and js.get("items"):
+        kw["items"] = _to_schema(js["items"])
+    return types.Schema(**kw)
+
+def _gemini_tools():
+    from google.genai import types
+    decls = []
+    for t in TOOLS:
+        props = t["input_schema"].get("properties") or {}
+        params = _to_schema(t["input_schema"]) if props else None
+        decls.append(types.FunctionDeclaration(
+            name=t["name"], description=t["description"], parameters=params))
+    return [types.Tool(function_declarations=decls)]
+
+def call_llm(system, user, json_mode=False):
+    from google.genai import types
+    cfg = types.GenerateContentConfig(system_instruction=system, temperature=0.2)
+    if json_mode:
+        cfg.response_mime_type = "application/json"
+    resp = _genai().models.generate_content(model=MODEL, contents=user, config=cfg)
+    return resp.text or ""
 
 def extract_items(text):
     now = dt.datetime.now().isoformat(timespec="minutes")
-    raw = call_claude(EXTRACT_SYS, f"Current datetime: {now}\n\nNote:\n{text}").strip()
+    raw = call_llm(EXTRACT_SYS, f"Current datetime: {now}\n\nNote:\n{text}",
+                   json_mode=True).strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1].removeprefix("json").strip()
     try:
@@ -478,59 +514,60 @@ def capture(inp: CaptureIn, user=Depends(auth.current_user)):
     return {"created": store_items(parsed, inp.text, user["id"]), "items": parsed}
 
 def friendly_ai_error(e) -> str:
-    """Turn an Anthropic SDK exception into a clear message for the user."""
+    """Turn a Gemini SDK exception into a clear message for the user."""
     msg = str(e); low = msg.lower()
-    if "credit balance is too low" in low or "plans & billing" in low:
-        return ("⚠️ The AI is offline — this ATLAS instance's Anthropic API key has "
-                "no credits. Add credits at console.anthropic.com → Plans & Billing, "
-                "then try again.")
-    if "authentication" in low or "invalid x-api-key" in low or "401" in low:
-        return "⚠️ The AI key is missing or invalid. Set ANTHROPIC_API_KEY and restart."
-    if "rate limit" in low or "429" in low:
-        return "⚠️ Rate-limited by the AI provider. Give it a moment and retry."
-    if "overloaded" in low or "529" in low:
-        return "⚠️ The AI provider is overloaded right now. Please retry shortly."
+    if "gemini_api_key not set" in low or "api key not valid" in low or \
+            "api_key_invalid" in low or "invalid api key" in low:
+        return ("⚠️ The AI key is missing or invalid. Get a free Gemini key at "
+                "aistudio.google.com/app/apikey, set GEMINI_API_KEY, and restart.")
+    if "resource_exhausted" in low or "quota" in low or "429" in low or \
+            "rate limit" in low:
+        return ("⚠️ Gemini's free-tier limit was hit for the moment. Wait a bit and "
+                "retry (there are per-minute request caps).")
+    if "503" in low or "overloaded" in low or "unavailable" in low:
+        return "⚠️ Gemini is busy right now. Please retry in a moment."
     return "⚠️ The AI request failed: " + msg[:200]
 
 def run_agent(messages: list[dict], uid="local", name="there") -> dict:
-    """Shared agent loop used by the web chat AND the Telegram bot. Takes a
-    conversation (list of {role, content}) and returns {reply, actions, pending}.
-    All tool actions are scoped to the given user (uid)."""
-    import anthropic
+    """Shared agent loop (Gemini function-calling) used by the web chat AND the
+    Telegram bot. Returns {reply, actions, pending}; all tool actions scoped to uid."""
+    from google.genai import types
     try:
-        client = anthropic.Anthropic()
+        client = _genai()
     except Exception as e:
         return {"reply": friendly_ai_error(e), "actions": [], "pending": []}
     sys = CHAT_SYS.format(user=name, tz=gcal.TZ,
                           now=dt.datetime.now().isoformat(timespec="minutes"))
-    msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
+    cfg = types.GenerateContentConfig(system_instruction=sys, tools=_gemini_tools(),
+                                      temperature=0.3)
+    contents = [types.Content(
+        role=("model" if m["role"] == "assistant" else "user"),
+        parts=[types.Part(text=str(m["content"]))]) for m in messages]
     actions = []
     for _ in range(8):   # room for multi-step research (search -> read -> answer)
         try:
-            resp = client.messages.create(model=MODEL, max_tokens=1500, system=sys,
-                                           tools=TOOLS, messages=msgs)
+            resp = client.models.generate_content(model=MODEL, contents=contents, config=cfg)
         except Exception as e:
             return {"reply": friendly_ai_error(e), "actions": actions,
                     "pending": [a for a in actions if a["pending"]]}
-        if resp.stop_reason == "tool_use":
-            msgs.append({"role": "assistant",
-                         "content": [b.model_dump() for b in resp.content]})
-            results = []
-            for blk in resp.content:
-                if blk.type == "tool_use":
-                    out = run_tool(blk.name, blk.input, uid)
-                    pend = isinstance(out, dict) and out.get("pending")
-                    actions.append({"tool": blk.name, "input": blk.input,
-                                    "pending": bool(pend)})
-                    content = ("AWAITING APPROVAL: you PROPOSED this action; it is "
-                               "NOT done yet. Tell the user you've prepared it and "
-                               "are waiting for their approval." if pend
-                               else json.dumps(out)[:4000])
-                    results.append({"type": "tool_result", "tool_use_id": blk.id,
-                                    "content": content})
-            msgs.append({"role": "user", "content": results})
+        cand = resp.candidates[0] if resp.candidates else None
+        pin = cand.content.parts if (cand and cand.content and cand.content.parts) else []
+        fcs = [p.function_call for p in pin if getattr(p, "function_call", None)]
+        if fcs:
+            contents.append(cand.content)          # the model's tool-call turn
+            replies = []
+            for fc in fcs:
+                args = dict(fc.args) if fc.args else {}
+                out = run_tool(fc.name, args, uid)
+                pend = isinstance(out, dict) and out.get("pending")
+                actions.append({"tool": fc.name, "input": args, "pending": bool(pend)})
+                payload = ({"status": "PROPOSED — awaiting the user's approval; NOT done"}
+                           if pend else out)
+                replies.append(types.Part.from_function_response(
+                    name=fc.name, response={"result": payload}))
+            contents.append(types.Content(role="user", parts=replies))
             continue
-        text = "".join(b.text for b in resp.content if b.type == "text")
+        text = "".join(p.text for p in pin if getattr(p, "text", None))
         return {"reply": text, "actions": actions,
                 "pending": [a for a in actions if a["pending"]]}
     return {"reply": "I took several steps but stopped to avoid looping. "

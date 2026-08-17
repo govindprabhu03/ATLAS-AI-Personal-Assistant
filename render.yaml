@@ -15,11 +15,19 @@ services:
       - key: PYTHON_VERSION
         value: "3.12.7"
       - key: ATLAS_MODEL
-        value: claude-sonnet-5
+        value: gemini-2.5-flash
       - key: ATLAS_TZ
         value: Asia/Kolkata
       # ---- secrets: set these in the Render dashboard (Environment tab) ----
-      - key: ANTHROPIC_API_KEY
+      # AI engine — free key from aistudio.google.com/app/apikey
+      - key: GEMINI_API_KEY
+        sync: false
+      # Accounts (optional) — Supabase project → Settings → API
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_JWT_SECRET
         sync: false
       # Google Calendar + Gmail (optional). Generate token.json locally with
       # `python authorize.py`, then paste file contents into these:
