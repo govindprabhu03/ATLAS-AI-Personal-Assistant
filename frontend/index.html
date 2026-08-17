@@ -225,6 +225,9 @@
       <label>Draft emails
         <select id="permMail"><option value="ask">Ask me first</option>
           <option value="auto">Do it automatically</option></select></label>
+      <label>Your timezone
+        <input id="permTz" placeholder="e.g. Asia/Kolkata"
+          style="background:rgba(8,14,30,.9);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:8px;font:inherit"></label>
       <div style="display:flex;gap:8px;margin-top:8px">
         <button class="mini ok" onclick="savePerms()">Save</button>
         <button class="mini no" onclick="togglePerms()">Close</button></div>
@@ -361,10 +364,12 @@ function approvalCard(a){
 function togglePerms(){const p=$('#perms');p.hidden=!p.hidden;if(!p.hidden)loadPerms();}
 async function loadPerms(){const s=await api('/api/settings');
   $('#permCal').value=s.create_calendar_event||'ask';$('#permMail').value=s.draft_email||'ask';
+  $('#permTz').value=s.tz||'';
   if(s.avatar_url!==undefined)$('#avatarUrl').value=s.avatar_url||'';}
 async function savePerms(){await api('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({settings:{create_calendar_event:$('#permCal').value,draft_email:$('#permMail').value}})});
-  toast('Permissions saved');togglePerms();}
+  body:JSON.stringify({settings:{create_calendar_event:$('#permCal').value,draft_email:$('#permMail').value,
+    tz:$('#permTz').value.trim()||'Asia/Kolkata'}})});
+  toast('Settings saved');togglePerms();refresh();}
 async function saveAvatarUrl(url){await api('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({settings:{avatar_url:url}})});}
 function loadAvatar(){ const url=$('#avatarUrl').value.trim();

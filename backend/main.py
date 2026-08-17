@@ -39,24 +39,34 @@ FRONTEND = Path(__file__).parent.parent / "frontend"
 # ---- permission tiers -----------------------------------------------------
 # Outward/side-effecting tools default to "ask" (require user approval).
 # Levels: "auto" (do it) | "ask" (propose, wait for Approve in the UI).
-SETTINGS_PATH = Path(__file__).parent / "settings.json"
-DEFAULT_SETTINGS = {"create_calendar_event": "ask", "draft_email": "ask"}
+DEFAULT_SETTINGS = {"create_calendar_event": "ask", "draft_email": "ask",
+                    "tz": os.getenv("ATLAS_TZ", "Asia/Kolkata"), "avatar_url": ""}
 # Purchases ALWAYS require approval and can never be set to auto — ATLAS never pays.
 ALWAYS_ASK = {"propose_purchase"}
 
-def load_settings():
+def load_settings(uid="local"):
+    """Per-user settings (permissions, timezone, avatar) stored in the DB."""
     try:
-        return {**DEFAULT_SETTINGS, **json.loads(SETTINGS_PATH.read_text())}
+        with closing(db()) as c:
+            r = c.execute("SELECT data FROM user_settings WHERE user_id=?", (uid,)).fetchone()
+        stored = json.loads(r["data"]) if r else {}
     except Exception:
-        return dict(DEFAULT_SETTINGS)
+        stored = {}
+    return {**DEFAULT_SETTINGS, **stored}
 
-def save_settings(s):
-    SETTINGS_PATH.write_text(json.dumps(s))
+def save_settings(uid, patch):
+    cur = load_settings(uid); cur.update(patch)
+    with closing(db()) as c:
+        c.execute("INSERT INTO user_settings(user_id,data) VALUES(?,?) "
+                  "ON CONFLICT(user_id) DO UPDATE SET data=excluded.data",
+                  (uid, json.dumps(cur)))
+        c.commit()
+    return cur
 
-def needs_approval(tool):
+def needs_approval(tool, uid="local"):
     if tool in ALWAYS_ASK:
         return True
-    return load_settings().get(tool, "auto") == "ask"
+    return load_settings(uid).get(tool, "auto") == "ask"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items(
@@ -73,8 +83,13 @@ CREATE TABLE IF NOT EXISTS items(
   google_event_id TEXT,                     -- set when synced to Google Calendar
   link TEXT,                                -- store/checkout URL for purchases
   recurring_id INTEGER,                     -- template this occurrence came from
+  est_minutes INTEGER DEFAULT 60,           -- estimated effort, drives scheduling
   source_text TEXT,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_settings(
+  user_id TEXT PRIMARY KEY,
+  data TEXT NOT NULL DEFAULT '{}'           -- per-user JSON (permissions, tz, avatar)
 );
 CREATE TABLE IF NOT EXISTS memory(
   id {pk},
@@ -100,14 +115,16 @@ db = store.connect          # returns a connection wrapper (SQLite or Postgres)
 def init_db():
     with closing(db()) as c:
         c.executescript(SCHEMA.replace("{pk}", store.PK))
-        if not store.is_postgres():                  # migrate older SQLite DBs
+        if store.is_postgres():                      # Postgres supports IF NOT EXISTS
+            c.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS est_minutes INTEGER DEFAULT 60")
+        else:                                        # migrate older SQLite DBs
             cols = [r[1] for r in c.execute("PRAGMA table_info(items)")]
-            if "link" not in cols:
-                c.execute("ALTER TABLE items ADD COLUMN link TEXT")
-            if "user_id" not in cols:
-                c.execute("ALTER TABLE items ADD COLUMN user_id TEXT NOT NULL DEFAULT 'local'")
-            if "recurring_id" not in cols:
-                c.execute("ALTER TABLE items ADD COLUMN recurring_id INTEGER")
+            for col, typ in [("link", "TEXT"),
+                             ("user_id", "TEXT NOT NULL DEFAULT 'local'"),
+                             ("recurring_id", "INTEGER"),
+                             ("est_minutes", "INTEGER DEFAULT 60")]:
+                if col not in cols:
+                    c.execute(f"ALTER TABLE items ADD COLUMN {col} {typ}")
         c.commit()
 
 def row_to_dict(r): return dict(r)
@@ -144,6 +161,21 @@ def _genai():
         _GENAI_CLIENT = genai.Client(api_key=key)
     return _GENAI_CLIENT
 
+_TRANSIENT = ("503", "500", "429", "overloaded", "unavailable", "resource_exhausted")
+def _generate(**kwargs):
+    """generate_content with retry/backoff for Gemini's transient free-tier errors."""
+    import time
+    last = None
+    for attempt in range(3):
+        try:
+            return _genai().models.generate_content(**kwargs)
+        except Exception as e:
+            last = e
+            if any(x in str(e).lower() for x in _TRANSIENT):
+                time.sleep(1.2 * (attempt + 1)); continue
+            raise
+    raise last
+
 _GTYPE = {"string": "STRING", "integer": "INTEGER", "number": "NUMBER",
           "boolean": "BOOLEAN", "object": "OBJECT", "array": "ARRAY"}
 
@@ -175,7 +207,7 @@ def call_llm(system, user, json_mode=False):
     cfg = types.GenerateContentConfig(system_instruction=system, temperature=0.2)
     if json_mode:
         cfg.response_mime_type = "application/json"
-    resp = _genai().models.generate_content(model=MODEL, contents=user, config=cfg)
+    resp = _generate(model=MODEL, contents=user, config=cfg)
     return resp.text or ""
 
 def extract_items(text):
@@ -243,36 +275,82 @@ def _busy(c, uid, horizon_days=60):
             print("calendar busy fetch failed:", e)
     return out
 
-def _next_free_block(after, busy):
+def _next_free_block(after, busy, minutes=BLOCK_MINUTES):
     t = after.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
     for _ in range(24 * 60):
-        if t.hour < WORK_START: t = t.replace(hour=WORK_START)
-        if t.hour >= WORK_END:
-            t = (t + dt.timedelta(days=1)).replace(hour=WORK_START)
-        end = t + dt.timedelta(minutes=BLOCK_MINUTES)
+        if t.hour < WORK_START:
+            t = t.replace(hour=WORK_START)
+        day_end = t.replace(hour=WORK_END, minute=0, second=0, microsecond=0)
+        end = t + dt.timedelta(minutes=minutes)
+        if end > day_end:                          # doesn't fit today -> next day
+            t = (t + dt.timedelta(days=1)).replace(hour=WORK_START, minute=0); continue
         if not any(t < b_end and end > b_start for b_start, b_end in busy):
             return t, end
         t = end
-    return t, t + dt.timedelta(minutes=BLOCK_MINUTES)
+    return t, t + dt.timedelta(minutes=minutes)
+
+# highest priority first, then earliest deadline
+_PRIORITY_SQL = ("CASE priority WHEN 'critical' THEN 0 WHEN 'important' THEN 1 "
+                 "ELSE 2 END, (deadline IS NULL), deadline")
 
 def schedule_unplanned(uid="local"):
-    """Give every open, unscheduled leaf task a work block before its deadline,
-    earliest-deadline-first, and push it to Google Calendar. Scoped to one user."""
+    """Place every open, unscheduled leaf task into a free block — highest
+    priority first, then earliest deadline — using each task's effort estimate.
+    Scoped to one user; synced to Google Calendar."""
     with closing(db()) as c:
         tasks = c.execute(
             "SELECT * FROM items WHERE user_id=? AND type='task' AND status='open' "
             "AND scheduled_start IS NULL "
-            "AND id NOT IN (SELECT parent_id FROM items WHERE parent_id IS NOT NULL)"
-            " ORDER BY (deadline IS NULL), deadline", (uid,)).fetchall()
-        busy = _busy(c, uid); cursor = dt.datetime.now()
+            "AND id NOT IN (SELECT parent_id FROM items WHERE parent_id IS NOT NULL) "
+            "ORDER BY " + _PRIORITY_SQL, (uid,)).fetchall()
+        busy = _busy(c, uid)
         for t in tasks:
-            start, end = _next_free_block(cursor, busy)
-            busy.append((start, end)); cursor = start
+            mins = t["est_minutes"] or BLOCK_MINUTES
+            start, end = _next_free_block(dt.datetime.now(), busy, mins)
+            busy.append((start, end))
             c.execute("UPDATE items SET scheduled_start=?,scheduled_end=? WHERE id=?",
                       (start.isoformat(), end.isoformat(), t["id"]))
             _sync_event(c, t["id"], t["title"], start.isoformat(),
                         end.isoformat(), t["priority"])
         c.commit()
+
+def reschedule_all(uid="local"):
+    """Clear and re-plan all open leaf tasks so the day reshuffles by current
+    priorities/deadlines (e.g. after something changed)."""
+    with closing(db()) as c:
+        ids = [r["id"] for r in c.execute(
+            "SELECT id FROM items WHERE user_id=? AND type='task' AND status='open' "
+            "AND id NOT IN (SELECT parent_id FROM items WHERE parent_id IS NOT NULL)",
+            (uid,))]
+    _unsync(uid, ids)
+    with closing(db()) as c:
+        c.execute("UPDATE items SET scheduled_start=NULL, scheduled_end=NULL, "
+                  "google_event_id=NULL WHERE user_id=? AND type='task' AND status='open' "
+                  "AND id NOT IN (SELECT parent_id FROM items WHERE parent_id IS NOT NULL)",
+                  (uid,))
+        c.commit()
+    schedule_unplanned(uid)
+
+def edit_item(uid, item_id, title=None, priority=None, deadline=None,
+              scheduled_start=None, est_minutes=None):
+    fields = {}
+    if title is not None: fields["title"] = title
+    if priority is not None: fields["priority"] = priority
+    if deadline is not None: fields["deadline"] = deadline
+    if est_minutes is not None: fields["est_minutes"] = est_minutes
+    if scheduled_start is not None:
+        fields["scheduled_start"] = scheduled_start
+        mins = est_minutes or 60
+        d = parse_dt(scheduled_start)
+        if d: fields["scheduled_end"] = (d + dt.timedelta(minutes=mins)).isoformat()
+    if not fields:
+        return {"error": "nothing to update"}
+    sets = ", ".join(f"{k}=?" for k in fields)
+    with closing(db()) as c:
+        c.execute(f"UPDATE items SET {sets} WHERE user_id=? AND id=?",
+                  list(fields.values()) + [uid, item_id])
+        c.commit()
+    return {"updated": item_id, "changed": fields}
 
 def _unsync(uid, item_ids):
     if not gcal.is_configured() or not item_ids: return
@@ -438,10 +516,15 @@ def build_brief(uid="local", name="there"):
     todays.sort(key=lambda x: x[0])
     schedule = [{"time": s.strftime("%H:%M"), "title": r["title"],
                  "priority": r["priority"], "id": r["id"]} for s, r in todays]
-    hour = now.hour
-    greet = ("Good morning" if hour < 12 else
-             "Good afternoon" if hour < 17 else "Good evening")
-    av = load_settings().get("avatar_url")
+    s = load_settings(uid)
+    try:
+        from zoneinfo import ZoneInfo
+        uhour = dt.datetime.now(ZoneInfo(s.get("tz", "Asia/Kolkata"))).hour
+    except Exception:
+        uhour = now.hour
+    greet = ("Good morning" if uhour < 12 else
+             "Good afternoon" if uhour < 17 else "Good evening")
+    av = s.get("avatar_url")
     if not av and (FRONTEND / "avatar.glb").exists():
         av = "/static/avatar.glb"
     return {"greeting": f"{greet}, {name}.", "date": today.isoformat(),
@@ -524,6 +607,22 @@ TOOLS = [
       "required": ["title", "freq"]}},
  {"name": "list_recurring", "description": "List the user's active recurring items.",
   "input_schema": {"type": "object", "properties": {}}},
+ {"name": "update_item", "description": "Change an existing item: its title, "
+  "priority, deadline, scheduled time, or effort estimate. Call `list_items` first "
+  "to get the item's id. Use for 'move/reschedule/rename/make urgent/push the "
+  "deadline'.",
+  "input_schema": {"type": "object", "properties": {
+      "id": {"type": "integer"},
+      "title": {"type": "string"},
+      "priority": {"type": "string", "description": "critical|important|routine"},
+      "deadline": {"type": "string", "description": "ISO date/datetime"},
+      "scheduled_start": {"type": "string", "description": "ISO local datetime to move the work block to"},
+      "est_minutes": {"type": "integer", "description": "estimated effort in minutes"}},
+      "required": ["id"]}},
+ {"name": "reschedule", "description": "Re-plan the whole day: reshuffle all open "
+  "tasks into free time by priority and deadline (use after things change or the "
+  "user falls behind).",
+  "input_schema": {"type": "object", "properties": {}}},
 ]
 
 class StatusIn(BaseModel): status: str
@@ -532,7 +631,7 @@ def _plus_hour(s):
     return (parse_dt(s) + dt.timedelta(hours=1)).isoformat() if parse_dt(s) else s
 
 def run_tool(name, inp, uid="local", approved=False):
-    if not approved and needs_approval(name):
+    if not approved and needs_approval(name, uid):
         return {"pending": True, "tool": name, "input": inp,
                 "message": "Proposed — awaiting the user's approval."}
     try:
@@ -595,6 +694,12 @@ def run_tool(name, inp, uid="local", approved=False):
                                  priority=inp.get("priority", "routine"))
         if name == "list_recurring":
             return list_recurring(uid)
+        if name == "update_item":
+            return edit_item(uid, inp["id"], inp.get("title"), inp.get("priority"),
+                             inp.get("deadline"), inp.get("scheduled_start"),
+                             inp.get("est_minutes"))
+        if name == "reschedule":
+            reschedule_all(uid); return {"rescheduled": True}
         return {"error": f"unknown tool {name}"}
     except Exception as e:
         return {"error": str(e)}
@@ -611,6 +716,9 @@ Use your tools to ACTUALLY do things, don't just describe them:
   habits, likes/dislikes, home or work details, ongoing goals) -> `remember` it.
 - Anything that repeats ("every day/Monday/month", "daily", "each morning") ->
   `add_recurring`.
+- To move/rename/reschedule a task, change its deadline, or make it urgent ->
+  `list_items` for the id, then `update_item`. To re-plan the whole day ->
+  `reschedule`.
 - Anything to plan/remember/get done -> `capture` (it decomposes & schedules).
 - A specific appointment at a specific time -> `create_calendar_event`.
 - Questions about today/priorities -> `get_brief`; about tasks -> `list_items`;
@@ -706,7 +814,7 @@ def run_agent(messages: list[dict], uid="local", name="there") -> dict:
     actions = []
     for _ in range(8):   # room for multi-step research (search -> read -> answer)
         try:
-            resp = client.models.generate_content(model=MODEL, contents=contents, config=cfg)
+            resp = _generate(model=MODEL, contents=contents, config=cfg)
         except Exception as e:
             return {"reply": friendly_ai_error(e), "actions": actions,
                     "pending": [a for a in actions if a["pending"]]}
@@ -758,7 +866,7 @@ def api_delete(item_id: int, user=Depends(auth.current_user)):
 
 @app.post("/api/replan")
 def replan(user=Depends(auth.current_user)):
-    schedule_unplanned(user["id"]); return {"ok": True}
+    reschedule_all(user["id"]); return {"ok": True}
 
 class ExecIn(BaseModel):
     tool: str
@@ -773,11 +881,11 @@ class SettingsIn(BaseModel):
     settings: dict
 
 @app.get("/api/settings")
-def get_settings(user=Depends(auth.current_user)): return load_settings()
+def get_settings(user=Depends(auth.current_user)): return load_settings(user["id"])
 
 @app.put("/api/settings")
 def put_settings(s: SettingsIn, user=Depends(auth.current_user)):
-    cur = load_settings(); cur.update(s.settings); save_settings(cur); return cur
+    return save_settings(user["id"], s.settings)
 
 @app.get("/api/brief")
 def brief(user=Depends(auth.current_user)):
