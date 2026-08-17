@@ -172,6 +172,8 @@
   @keyframes spinR{to{transform:translate(-50%,-50%) rotate(-360deg)}}
   @keyframes fadeUp{0%{opacity:0;transform:translateY(12px)}100%{opacity:1;transform:none}}
   @keyframes glowpulse{0%,100%{box-shadow:0 0 30px rgba(110,168,254,.45)}50%{box-shadow:0 0 48px rgba(183,139,255,.75)}}
+  #onboard{display:none;position:fixed;inset:0;z-index:110;align-items:center;justify-content:center;
+    background:radial-gradient(900px 600px at 50% 10%,#141d44,#05060d 72%)}
   /* sign-in overlay */
   #authOverlay{display:none;position:fixed;inset:0;z-index:100;align-items:center;
     justify-content:center;background:radial-gradient(900px 600px at 50% 0%,#141d44,#05060d 70%)}
@@ -295,6 +297,19 @@
   </div>
 </div>
 
+<!-- First-run onboarding -->
+<div id="onboard">
+  <div class="authcard">
+    <div class="authlogo" style="font-size:20px">WELCOME</div>
+    <div class="authsub">Let's set up ATLAS — 10 seconds</div>
+    <label style="display:block;text-align:left;color:var(--mut);font-size:12.5px;margin-bottom:6px">Your timezone
+      <input id="obTz" style="width:100%;margin-top:5px;background:rgba(8,14,30,.9);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:10px;font:inherit"></label>
+    <button class="mini no" style="width:100%;padding:11px;margin-bottom:6px" onclick="obNotify()">🔔 Enable notifications</button>
+    <div id="obNote" class="authnote"></div>
+    <button class="mini ok" style="width:100%;padding:12px;margin-top:10px" onclick="finishOnboarding()">Start using ATLAS →</button>
+  </div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="/static/vendor/three.min.js"></script>
 <script src="/static/vendor/GLTFLoader.js"></script>
@@ -397,8 +412,35 @@ let notifOn=false;const seenAttention=new Set();let primed=false;
 async function enableReminders(){ if(!('Notification'in window)){toast('Notifications not supported');return;}
   const p=await Notification.requestPermission();notifOn=(p==='granted');
   $('#bell').textContent=notifOn?'🔔 Reminders on':'🔔 Reminders blocked';$('#bell').classList.toggle('on',notifOn);
-  if(notifOn)toast('ATLAS will now nudge you about overdue & upcoming items');}
+  if(notifOn){ await subscribePush(); toast('ATLAS will nudge you — even when the app is closed'); }}
 function remind(t){if(notifOn){try{new Notification('ATLAS · reminder',{body:t});}catch(_){}}}
+/* web-push: proactive nudges even when the app is closed */
+function urlB64ToUint8(b64){const pad='='.repeat((4-b64.length%4)%4);
+  const s=(b64+pad).replace(/-/g,'+').replace(/_/g,'/');const raw=atob(s);
+  return Uint8Array.from([...raw].map(c=>c.charCodeAt(0)));}
+async function subscribePush(){
+  try{
+    if(!('serviceWorker'in navigator)||!('PushManager'in window))return false;
+    const cfg=window._cfg||(window._cfg=await fetch('/api/config').then(r=>r.json()));
+    if(!cfg.push_key)return false;
+    const reg=await navigator.serviceWorker.ready;
+    let sub=await reg.pushManager.getSubscription();
+    if(!sub) sub=await reg.pushManager.subscribe({userVisibleOnly:true,
+      applicationServerKey:urlB64ToUint8(cfg.push_key)});
+    await api('/api/push-subscribe',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({subscription:sub})});
+    return true;
+  }catch(e){ console.warn('push subscribe failed',e); return false; }
+}
+/* onboarding */
+function showOnboarding(s){ $('#obTz').value=(s&&s.tz)||Intl.DateTimeFormat().resolvedOptions().timeZone||'Asia/Kolkata';
+  $('#onboard').style.display='flex'; }
+async function checkOnboarding(){ const s=await api('/api/settings'); if(s&&!s.onboarded)showOnboarding(s); }
+async function obNotify(){ await enableReminders(); $('#obNote').textContent=notifOn?'Notifications on ✓':'You can enable this later in ⚙'; }
+async function finishOnboarding(){
+  await api('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({settings:{tz:$('#obTz').value.trim()||'Asia/Kolkata',onboarded:true}})});
+  $('#onboard').style.display='none';toast('All set — welcome to ATLAS!');refresh();}
 async function pollReminders(){ try{const b=await api('/api/brief');(b.attention||[]).forEach(a=>{
   if(!seenAttention.has(a)){seenAttention.add(a);
     if(primed){remind(a);toast('🔔 '+a);
@@ -499,7 +541,7 @@ function startApp(){
   setState('speaking');
   saySoft("Hi — I'm ATLAS. Tap the mic and tell me what's on your mind, and I'll plan it, schedule it, and follow up.");
   setTimeout(()=>{speaking=false;setState('idle');},4600);
-  refresh().then(pollReminders); setInterval(pollReminders,60000);
+  refresh().then(pollReminders).then(checkOnboarding); setInterval(pollReminders,60000);
 }
 async function initAuth(){
   let cfg; try{ cfg=await fetch('/api/config').then(r=>r.json()); }catch(e){ cfg={auth_required:false}; }

@@ -1,5 +1,5 @@
 /* ATLAS service worker — fresh UI (network-first HTML), offline-capable shell. */
-const CACHE = 'atlas-v9';
+const CACHE = 'atlas-v10';
 const SHELL = ['/', '/static/icon-192.png', '/static/icon-512.png',
                '/manifest.webmanifest'];
 
@@ -11,6 +11,19 @@ self.addEventListener('activate', e => {
   e.waitUntil(caches.keys()
     .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
     .then(() => self.clients.claim()));
+});
+
+// Web-push: show a notification even when the app is closed.
+self.addEventListener('push', e => {
+  let d = {title: 'ATLAS', body: ''};
+  try { d = e.data.json(); } catch (_) { if (e.data) d.body = e.data.text(); }
+  e.waitUntil(self.registration.showNotification(d.title || 'ATLAS',
+    {body: d.body || '', icon: '/static/icon-192.png', badge: '/static/icon-192.png'}));
+});
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  e.waitUntil(clients.matchAll({type: 'window'}).then(cs =>
+    cs.length ? cs[0].focus() : clients.openWindow('/')));
 });
 
 self.addEventListener('fetch', e => {

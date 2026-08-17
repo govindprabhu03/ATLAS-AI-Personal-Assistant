@@ -29,6 +29,7 @@ import gmail_client as gmail
 import web_client as web
 import auth
 import store
+import push
 
 # ---- config ---------------------------------------------------------------
 MODEL = os.getenv("ATLAS_MODEL", "gemini-flash-latest")   # Google Gemini (free tier)
@@ -117,6 +118,9 @@ CREATE TABLE IF NOT EXISTS link_codes(
 CREATE TABLE IF NOT EXISTS notified(
   user_id TEXT NOT NULL, nkey TEXT NOT NULL, created_at TEXT NOT NULL,
   PRIMARY KEY(user_id, nkey)
+);
+CREATE TABLE IF NOT EXISTS push_subs(
+  endpoint TEXT PRIMARY KEY, user_id TEXT NOT NULL, sub TEXT NOT NULL, created_at TEXT NOT NULL
 );
 """
 
@@ -560,30 +564,73 @@ def brief_text(uid, name="there"):
 def due_nudges(uid):
     return [a for a in build_brief(uid)["attention"] if "overdue" in a]
 
+# ---- push subscriptions + unified notifications ---------------------------
+def save_push_sub(uid, sub):
+    ep = sub.get("endpoint")
+    if not ep:
+        return {"error": "no endpoint"}
+    with closing(db()) as c:
+        c.execute("INSERT INTO push_subs(endpoint,user_id,sub,created_at) VALUES(?,?,?,?) "
+                  "ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id, "
+                  "sub=excluded.sub", (ep, uid, json.dumps(sub), dt.datetime.now().isoformat()))
+        c.commit()
+    return {"ok": True}
+
+def _push_subs(uid):
+    with closing(db()) as c:
+        return [json.loads(r["sub"]) for r in
+                c.execute("SELECT sub FROM push_subs WHERE user_id=?", (uid,))]
+
+def _chat_for_user(uid):
+    with closing(db()) as c:
+        r = c.execute("SELECT chat_id FROM telegram_links WHERE user_id=? LIMIT 1",
+                      (uid,)).fetchone()
+    return r["chat_id"] if r else None
+
+def notify_user(uid, title, body):
+    """Deliver a proactive message over every channel the user has connected:
+    web-push and/or Telegram."""
+    for sub in _push_subs(uid):
+        push.send(sub, title, body)
+    chat = _chat_for_user(uid)
+    if chat:
+        try:
+            import telegram_bot
+            telegram_bot.send(chat, f"{title}\n{body}" if body else title)
+        except Exception as e:
+            print("telegram notify failed:", e)
+
+def _notifiable_users():
+    users = set()
+    with closing(db()) as c:
+        for r in c.execute("SELECT DISTINCT user_id FROM telegram_links"):
+            users.add(r["user_id"])
+        for r in c.execute("SELECT DISTINCT user_id FROM push_subs"):
+            users.add(r["user_id"])
+    return users
+
 def proactive_loop():
-    """Background: message each linked Telegram chat their morning brief (at their
-    tz's brief hour, once/day) and any new overdue nudges."""
-    import time, telegram_bot
+    """Background: deliver each user their morning brief (at their tz's brief hour,
+    once/day) and new overdue nudges, via web-push and/or Telegram."""
+    import time
     from zoneinfo import ZoneInfo
     print("ATLAS proactive loop started.")
     while True:
         try:
-            for link in linked_chats():
-                uid, chat = link["user_id"], link["chat_id"]
-                name = link.get("name") or "there"
+            for uid in _notifiable_users():
                 s = load_settings(uid)
                 try:
                     now = dt.datetime.now(ZoneInfo(s.get("tz", "Asia/Kolkata")))
                 except Exception:
                     now = dt.datetime.now()
-                hour = int(s.get("brief_hour", 8))
                 daykey = "brief-" + now.date().isoformat()
-                if now.hour == hour and not _notified(uid, daykey):
-                    telegram_bot.send(chat, brief_text(uid, name)); _mark_notified(uid, daykey)
+                if now.hour == int(s.get("brief_hour", 8)) and not _notified(uid, daykey):
+                    notify_user(uid, "ATLAS · your day", brief_text(uid))
+                    _mark_notified(uid, daykey)
                 for n in due_nudges(uid):
                     nk = "nudge-" + now.date().isoformat() + "-" + n[:40]
                     if not _notified(uid, nk):
-                        telegram_bot.send(chat, "🔔 " + n); _mark_notified(uid, nk)
+                        notify_user(uid, "🔔 Reminder", n); _mark_notified(uid, nk)
         except Exception as e:
             print("proactive loop error:", e)
         time.sleep(120)
@@ -857,14 +904,15 @@ materialize_google_files()
 init_db()
 
 @app.on_event("startup")
-def _maybe_start_telegram():
-    """Optionally run the Telegram long-poller in-process so a single web
-    service serves both the app and the bot (set RUN_TELEGRAM_IN_WEB=1)."""
+def _startup_workers():
+    """Proactive delivery loop always runs (web-push needs no token). The
+    Telegram long-poller runs in-process too when a token is configured."""
+    import threading
+    threading.Thread(target=proactive_loop, daemon=True).start()
     if os.getenv("RUN_TELEGRAM_IN_WEB") == "1" and os.getenv("TELEGRAM_BOT_TOKEN"):
-        import threading, telegram_bot
+        import telegram_bot
         threading.Thread(target=telegram_bot.run, daemon=True).start()
-        threading.Thread(target=proactive_loop, daemon=True).start()
-        print("Telegram bot + proactive loop started.")
+        print("Telegram bot started.")
 
 class CaptureIn(BaseModel): text: str
 
@@ -944,7 +992,20 @@ def display_name(user):
     return (user.get("email", "").split("@")[0] or "there") if user else "there"
 
 @app.get("/api/config")
-def config(): return auth.public_config()
+def config():
+    cfg = auth.public_config(); cfg["push_key"] = push.public_key(); return cfg
+
+class PushSub(BaseModel):
+    subscription: dict
+
+@app.post("/api/push-subscribe")
+def push_subscribe(inp: PushSub, user=Depends(auth.current_user)):
+    return save_push_sub(user["id"], inp.subscription)
+
+@app.post("/api/push-test")
+def push_test(user=Depends(auth.current_user)):
+    notify_user(user["id"], "ATLAS", "Push notifications are working \U0001f389")
+    return {"sent": True}
 
 @app.post("/api/chat")
 def chat(inp: ChatIn, user=Depends(auth.current_user)):

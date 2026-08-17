@@ -5,6 +5,7 @@ backend/token*.json*
 backend/*secret*.json
 backend/settings.json
 backend/atlas.db
+backend/vapid.json
 
 # python / build
 backend/.venv/

@@ -11,5 +11,6 @@ ddgs>=6.0
 requests>=2.31
 pyjwt>=2.8
 psycopg[binary]>=3.1
+pywebpush>=1.14
 
 

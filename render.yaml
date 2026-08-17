@@ -45,6 +45,13 @@ services:
         sync: false
       - key: RUN_TELEGRAM_IN_WEB
         value: "1"
+      # Web-push (optional). Auto-generated if unset, but Render's disk is
+      # ephemeral so set a fixed pair here to keep subscriptions valid across
+      # deploys. Generate once: python -c "import push,json;print(json.dumps(push.keys()))"
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
       # ---- durable storage (optional) ----
       # Free tier has an EPHEMERAL disk: tasks reset when the instance restarts.
       # For persistence, attach a Render Disk (paid) and point the DB at it:
