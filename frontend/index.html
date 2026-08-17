@@ -143,6 +143,35 @@
   .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--card);
     border:1px solid var(--line);padding:10px 16px;border-radius:11px;opacity:0;transition:.2s;
     backdrop-filter:blur(8px);z-index:50}
+  /* cinematic intro */
+  #intro{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;background:radial-gradient(1000px 720px at 50% 32%,#111b46,#05060d 70%);
+    transition:opacity .7s ease, transform .7s ease}
+  #intro.gone{opacity:0;transform:scale(1.12);pointer-events:none}
+  .introInner{position:relative;text-align:center;animation:floaty 5s ease-in-out infinite 1.1s}
+  .introRing{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+    width:min(64vmin,460px);height:min(64vmin,460px);border-radius:50%;filter:blur(9px);pointer-events:none;
+    background:conic-gradient(from 0deg,transparent,rgba(110,168,254,.4),transparent 42%,rgba(183,139,255,.4),transparent 72%);
+    animation:spin 9s linear infinite}
+  .introRing.r2{width:min(46vmin,320px);height:min(46vmin,320px);opacity:.7;animation:spinR 7s linear infinite}
+  .introName{font-family:var(--mono);font-weight:800;font-size:clamp(52px,13vw,150px);letter-spacing:.16em;
+    background:linear-gradient(90deg,#6ea8fe,#59e6ff,#b78bff,#6ea8fe);background-size:300% 100%;
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+    filter:drop-shadow(0 0 34px rgba(110,168,254,.55));
+    animation:introIn 1s cubic-bezier(.2,.9,.3,1.2) both, shimmer 4.5s linear infinite 1s}
+  .introTag{margin-top:10px;color:var(--mut);letter-spacing:.34em;text-transform:uppercase;font-size:12.5px;
+    font-family:var(--mono);opacity:0;animation:fadeUp .8s ease .7s forwards}
+  .diveBtn{margin-top:40px;padding:15px 30px;border:0;border-radius:40px;font-weight:700;font-size:15px;
+    cursor:pointer;color:#04122e;background:linear-gradient(135deg,#6ea8fe,#b78bff);opacity:0;
+    animation:fadeUp .7s ease 1.6s forwards, glowpulse 2.4s ease-in-out infinite 2.3s}
+  .diveBtn:hover{transform:translateY(-2px)}
+  @keyframes introIn{0%{opacity:0;transform:translateY(26px) scale(.82);filter:blur(12px)}100%{opacity:1;transform:none;filter:blur(0)}}
+  @keyframes shimmer{to{background-position:300% 0}}
+  @keyframes floaty{0%,100%{transform:translateY(0)}50%{transform:translateY(-9px)}}
+  @keyframes spin{to{transform:translate(-50%,-50%) rotate(360deg)}}
+  @keyframes spinR{to{transform:translate(-50%,-50%) rotate(-360deg)}}
+  @keyframes fadeUp{0%{opacity:0;transform:translateY(12px)}100%{opacity:1;transform:none}}
+  @keyframes glowpulse{0%,100%{box-shadow:0 0 30px rgba(110,168,254,.45)}50%{box-shadow:0 0 48px rgba(183,139,255,.75)}}
   /* sign-in overlay */
   #authOverlay{display:none;position:fixed;inset:0;z-index:100;align-items:center;
     justify-content:center;background:radial-gradient(900px 600px at 50% 0%,#141d44,#05060d 70%)}
@@ -167,6 +196,16 @@
 </head>
 <body>
 <div class="bgfx"></div><div class="stars"></div>
+
+<!-- Cinematic intro -->
+<div id="intro">
+  <div class="introRing"></div><div class="introRing r2"></div>
+  <div class="introInner">
+    <div class="introName">ATLAS</div>
+    <div class="introTag">Your personal AI manager</div>
+  </div>
+  <button class="diveBtn" onclick="dive()">Dive into your assistant &nbsp;→</button>
+</div>
 
 <div class="wrap">
   <div class="topbar">
@@ -447,9 +486,15 @@ async function doAuth(mode){
 }
 async function signOut(){ try{ if(sb)await sb.auth.signOut(); }catch(_){}
   AUTH_TOKEN=null; location.reload(); }
+function dive(){
+  try{ const u=new SpeechSynthesisUtterance(' '); u.volume=0; speechSynthesis.speak(u); }catch(_){}  // unlock audio
+  const intro=document.getElementById('intro');
+  if(intro){ intro.classList.add('gone'); setTimeout(()=>intro.style.display='none',700); }
+  initAuth();   // then: login gate (if configured) or straight into the app
+}
 window.addEventListener('load',()=>{
   try{ window.ATLAS3D&&ATLAS3D.init($('#scene')); }catch(e){ console.error('3D init failed',e); }
-  initAuth();
+  // the cinematic intro shows first; dive() kicks off auth + the app on click
 });
 
 /* ===== PWA ===== */
