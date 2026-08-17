@@ -916,8 +916,13 @@ def materialize_google_files():
 
 # ---- api ------------------------------------------------------------------
 app = FastAPI(title="ATLAS")
-materialize_google_files()
-init_db()
+try:
+    materialize_google_files()
+    init_db()
+except Exception as _e:
+    # Never let a boot-time DB/init hiccup take the whole service down (would 404
+    # everything). Log it; DB-backed routes surface the error per-request instead.
+    print("STARTUP init error (continuing to serve):", repr(_e))
 
 @app.on_event("startup")
 def _startup_workers():
@@ -1009,7 +1014,15 @@ def display_name(user):
 
 @app.get("/api/config")
 def config():
-    cfg = auth.public_config(); cfg["push_key"] = push.public_key(); return cfg
+    cfg = auth.public_config(); cfg["push_key"] = push.public_key()
+    cfg["db"] = "postgres" if store.is_postgres() else "sqlite"
+    try:
+        with closing(db()) as c:
+            c.execute("SELECT 1")
+        cfg["db_ok"] = True
+    except Exception as e:
+        cfg["db_ok"] = False; cfg["db_error"] = str(e)[:160]
+    return cfg
 
 class PushSub(BaseModel):
     subscription: dict
