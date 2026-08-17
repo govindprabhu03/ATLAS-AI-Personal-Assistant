@@ -177,16 +177,17 @@ def _genai():
 
 _TRANSIENT = ("503", "500", "429", "overloaded", "unavailable", "resource_exhausted")
 def _generate(**kwargs):
-    """generate_content with retry/backoff for Gemini's transient free-tier errors."""
+    """generate_content with retry/backoff for Gemini's frequent free-tier 503s.
+    Google's flash models get overloaded intermittently; retrying usually wins."""
     import time
     last = None
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             return _genai().models.generate_content(**kwargs)
         except Exception as e:
             last = e
             if any(x in str(e).lower() for x in _TRANSIENT):
-                time.sleep(1.2 * (attempt + 1)); continue
+                time.sleep(0.8 * (attempt + 1)); continue    # 0.8,1.6,2.4,3.2s
             raise
     raise last
 
