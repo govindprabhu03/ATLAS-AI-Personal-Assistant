@@ -15,7 +15,7 @@ services:
       - key: PYTHON_VERSION
         value: "3.12.7"
       - key: ATLAS_MODEL
-        value: gemini-flash-latest
+        value: gemini-flash-lite-latest
       - key: ATLAS_TZ
         value: Asia/Kolkata
       # ---- secrets: set these in the Render dashboard (Environment tab) ----

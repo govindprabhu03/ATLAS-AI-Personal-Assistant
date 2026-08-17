@@ -32,7 +32,7 @@ import store
 import push
 
 # ---- config ---------------------------------------------------------------
-MODEL = os.getenv("ATLAS_MODEL", "gemini-flash-latest")   # Google Gemini (free tier)
+MODEL = os.getenv("ATLAS_MODEL", "gemini-flash-lite-latest")   # fast + available on free tier
 WORK_START, WORK_END = 9, 21
 BLOCK_MINUTES = 60
 FRONTEND = Path(__file__).parent.parent / "frontend"
@@ -678,12 +678,19 @@ def build_brief(uid="local", name="there"):
 
 # ---- chat agent (tools) ---------------------------------------------------
 TOOLS = [
- {"name": "capture", "description": "Extract & store goals/tasks/commitments/"
-  "events from natural language, decompose goals into subtasks, and schedule "
-  "them into free time (auto-syncs to Google Calendar). Use for anything the "
-  "user wants to remember, plan, or get done.",
-  "input_schema": {"type": "object", "properties": {"text": {"type": "string"}},
-                   "required": ["text"]}},
+ {"name": "capture", "description": "Store tasks/goals/commitments/events the user "
+  "wants to remember, plan, or get done. YOU extract the structured items and "
+  "decompose goals into steps — pass them directly (do not describe, just call). "
+  "They're auto-scheduled into free time & synced to Calendar.",
+  "input_schema": {"type": "object", "properties": {"items": {"type": "array",
+      "items": {"type": "object", "properties": {
+          "type": {"type": "string", "description": "goal | task | commitment | event"},
+          "title": {"type": "string", "description": "short imperative phrase"},
+          "priority": {"type": "string", "description": "critical | important | routine"},
+          "deadline": {"type": "string", "description": "ISO date/datetime, or omit"},
+          "subtasks": {"type": "array", "items": {"type": "string"},
+                       "description": "ONLY for a goal: 3-7 concrete step titles"}},
+          "required": ["type", "title"]}}}, "required": ["items"]}},
  {"name": "list_items", "description": "List the user's current open items.",
   "input_schema": {"type": "object", "properties": {}}},
  {"name": "complete_item", "description": "Mark an item (and its subtasks) done.",
@@ -780,8 +787,11 @@ def run_tool(name, inp, uid="local", approved=False):
                 "message": "Proposed — awaiting the user's approval."}
     try:
         if name == "capture":
-            parsed = extract_items(inp["text"])
-            return {"created": len(store_items(parsed, inp["text"], uid)), "items": parsed}
+            items = inp.get("items") or []
+            # tolerate the model passing raw text instead of structured items
+            if not items and inp.get("text"):
+                items = extract_items(inp["text"])
+            return {"created": len(store_items(items, "chat", uid)), "items": items}
         if name == "list_items":
             return list_items_for(uid)
         if name == "complete_item":
@@ -856,6 +866,11 @@ What you know about {user} (long-term memory — use it naturally, don't recite 
 {memory}
 
 Use your tools to ACTUALLY do things, don't just describe them:
+- To plan/remember/get something done -> `capture` with structured items YOU
+  extract: type (goal|task|commitment|event), short title, priority, and an ISO
+  deadline (resolve "tomorrow"/"Friday" from the datetime above). For a goal,
+  include 3-7 subtasks. Split a compound request into multiple items. Just call
+  it — don't ask for confirmation.
 - When {user} shares a durable fact or preference (their manager/teammates/family,
   habits, likes/dislikes, home or work details, ongoing goals) -> `remember` it.
 - Anything that repeats ("every day/Monday/month", "daily", "each morning") ->
