@@ -29,6 +29,10 @@ services:
         sync: false
       - key: SUPABASE_JWT_SECRET
         sync: false
+      # Durable data — Supabase → Settings → Database → Connection string (URI).
+      # Use the POOLER URI (port 6543) for a web service. Leave unset = SQLite.
+      - key: DATABASE_URL
+        sync: false
       # Google Calendar + Gmail (optional). Generate token.json locally with
       # `python authorize.py`, then paste file contents into these:
       - key: GOOGLE_CREDENTIALS_JSON

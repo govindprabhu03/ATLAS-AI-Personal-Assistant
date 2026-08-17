@@ -28,9 +28,9 @@ import calendar_client as gcal
 import gmail_client as gmail
 import web_client as web
 import auth
+import store
 
 # ---- config ---------------------------------------------------------------
-DB_PATH = os.getenv("ATLAS_DB", str(Path(__file__).parent / "atlas.db"))
 MODEL = os.getenv("ATLAS_MODEL", "gemini-flash-latest")   # Google Gemini (free tier)
 WORK_START, WORK_END = 9, 21
 BLOCK_MINUTES = 60
@@ -60,7 +60,7 @@ def needs_approval(tool):
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id {pk},
   user_id TEXT NOT NULL DEFAULT 'local',    -- owner account (per-user isolation)
   type TEXT NOT NULL,                       -- goal | task | commitment | event
   title TEXT NOT NULL,
@@ -77,13 +77,13 @@ CREATE TABLE IF NOT EXISTS items(
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS memory(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id {pk},
   user_id TEXT NOT NULL DEFAULT 'local',
   content TEXT NOT NULL,                     -- a durable fact/preference about the user
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS recurring(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id {pk},
   user_id TEXT NOT NULL DEFAULT 'local',
   title TEXT NOT NULL,
   type TEXT DEFAULT 'task',                  -- task | event
@@ -95,22 +95,22 @@ CREATE TABLE IF NOT EXISTS recurring(
 );
 """
 
-def db():
-    c = sqlite3.connect(DB_PATH); c.row_factory = sqlite3.Row; return c
+db = store.connect          # returns a connection wrapper (SQLite or Postgres)
 
 def init_db():
     with closing(db()) as c:
-        c.executescript(SCHEMA)
-        cols = [r[1] for r in c.execute("PRAGMA table_info(items)")]
-        if "link" not in cols:                       # migrate older DBs
-            c.execute("ALTER TABLE items ADD COLUMN link TEXT")
-        if "user_id" not in cols:
-            c.execute("ALTER TABLE items ADD COLUMN user_id TEXT NOT NULL DEFAULT 'local'")
-        if "recurring_id" not in cols:
-            c.execute("ALTER TABLE items ADD COLUMN recurring_id INTEGER")
+        c.executescript(SCHEMA.replace("{pk}", store.PK))
+        if not store.is_postgres():                  # migrate older SQLite DBs
+            cols = [r[1] for r in c.execute("PRAGMA table_info(items)")]
+            if "link" not in cols:
+                c.execute("ALTER TABLE items ADD COLUMN link TEXT")
+            if "user_id" not in cols:
+                c.execute("ALTER TABLE items ADD COLUMN user_id TEXT NOT NULL DEFAULT 'local'")
+            if "recurring_id" not in cols:
+                c.execute("ALTER TABLE items ADD COLUMN recurring_id INTEGER")
         c.commit()
 
-def row_to_dict(r): return {k: r[k] for k in r.keys()}
+def row_to_dict(r): return dict(r)
 
 def parse_dt(x):
     try: return dt.datetime.fromisoformat(x) if x else None
@@ -131,12 +131,18 @@ Each item:
 Split compound notes into multiple items."""
 
 # ---- LLM engine: Google Gemini (free tier) --------------------------------
+_GENAI_CLIENT = None
 def _genai():
+    """One reused client — creating a fresh genai.Client per call closes the
+    shared HTTP transport ('client has been closed' errors)."""
+    global _GENAI_CLIENT
     key = os.getenv("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY not set")
-    from google import genai
-    return genai.Client(api_key=key)
+    if _GENAI_CLIENT is None:
+        from google import genai
+        _GENAI_CLIENT = genai.Client(api_key=key)
+    return _GENAI_CLIENT
 
 _GTYPE = {"string": "STRING", "integer": "INTEGER", "number": "NUMBER",
           "boolean": "BOOLEAN", "object": "OBJECT", "array": "ARRAY"}
@@ -203,11 +209,11 @@ def store_items(parsed, source, uid="local"):
             ss = se = None
             if typ == "event" and parse_dt(dl) and "T" in (dl or ""):
                 ss = dl; se = (parse_dt(dl) + dt.timedelta(hours=1)).isoformat()
-            cur = c.execute(
+            gid = c.insert(
                 "INSERT INTO items(user_id,type,title,priority,deadline,scheduled_start,"
                 "scheduled_end,source_text,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (uid, typ, it.get("title", "Untitled"), pri, dl, ss, se, source, now))
-            gid = cur.lastrowid; created.append(gid)
+            created.append(gid)
             if ss:
                 _sync_event(c, gid, it.get("title", "Event"), ss, se, pri)
             for st in (it.get("subtasks") or []):
