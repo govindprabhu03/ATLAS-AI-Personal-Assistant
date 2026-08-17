@@ -53,16 +53,36 @@ def edit(chat_id, msg_id, text):
         print("edit error:", e)
 
 
-def handle_message(chat_id, text):
-    if text.strip().lower() in ("/start", "/hi", "hi", "hello"):
-        send(chat_id, "Hi Govind — I'm ATLAS, your assistant. Tell me what to plan, "
-                      "schedule, research, or check, and I'll handle it. Anything I do "
-                      "to your calendar or email I'll ask you to approve first.")
+def handle_message(chat_id, text, name="there"):
+    t = text.strip()
+    low = t.lower()
+    # link this chat to a web account
+    if low.startswith("/link"):
+        parts = t.split()
+        if len(parts) < 2:
+            send(chat_id, "To connect your ATLAS account, open the web app → ⚙ → "
+                          "Connect Telegram, then send me: /link YOURCODE")
+            return
+        uid = main.resolve_link_code(parts[1], chat_id, name)
+        send(chat_id, "✅ Connected! I'll now use your account and can send you your "
+                      "daily brief here." if uid else "That code is invalid or expired — "
+                      "get a fresh one from the web app.")
+        return
+    uid = main.user_for_chat(chat_id)
+    if low in ("/start", "/hi", "hi", "hello"):
+        linked = uid != "local"
+        send(chat_id, f"Hi {name} — I'm ATLAS, your assistant. Tell me what to plan, "
+                      "schedule, research, or check. Say /brief for today's rundown."
+                      + ("" if linked else "\n\nTip: connect your account via the web "
+                         "app (⚙ → Connect Telegram) so your tasks sync."))
+        return
+    if low == "/brief":
+        send(chat_id, main.brief_text(uid, name))
         return
     hist = HIST.setdefault(chat_id, [])
     hist.append({"role": "user", "content": text})
     try:
-        res = main.run_agent(hist)
+        res = main.run_agent(hist, uid, name)
     except Exception as e:
         send(chat_id, f"Something went wrong: {e}")
         hist.pop()
@@ -91,7 +111,7 @@ def handle_callback(cb_id, chat_id, data, msg_id):
         return
     _, tool, inp = p
     if action == "ok":
-        out = main.run_tool(tool, inp, approved=True)
+        out = main.run_tool(tool, inp, main.user_for_chat(chat_id), approved=True)
         if isinstance(out, dict) and out.get("error"):
             edit(chat_id, msg_id, f"⚠ {describe(tool, inp)}\n{out['error']}")
         elif isinstance(out, dict) and out.get("open_url"):   # purchase hand-off
@@ -119,7 +139,9 @@ def run():
             offset = u["update_id"] + 1
             try:
                 if "message" in u and "text" in u["message"]:
-                    handle_message(u["message"]["chat"]["id"], u["message"]["text"])
+                    m = u["message"]
+                    fname = (m.get("from") or {}).get("first_name", "there")
+                    handle_message(m["chat"]["id"], m["text"], fname)
                 elif "callback_query" in u:
                     cq = u["callback_query"]
                     handle_callback(cq["id"], cq["message"]["chat"]["id"],

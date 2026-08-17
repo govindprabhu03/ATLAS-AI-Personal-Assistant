@@ -108,6 +108,16 @@ CREATE TABLE IF NOT EXISTS recurring(
   active INTEGER DEFAULT 1,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS telegram_links(
+  chat_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS link_codes(
+  code TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notified(
+  user_id TEXT NOT NULL, nkey TEXT NOT NULL, created_at TEXT NOT NULL,
+  PRIMARY KEY(user_id, nkey)
+);
 """
 
 db = store.connect          # returns a connection wrapper (SQLite or Postgres)
@@ -491,6 +501,93 @@ def spawn_recurring(uid, horizon=7):
         c.commit()
     schedule_unplanned(uid)
 
+# ---- Telegram linking + proactive delivery --------------------------------
+def make_link_code(uid):
+    import secrets
+    code = secrets.token_hex(3).upper()
+    with closing(db()) as c:
+        c.execute("INSERT INTO link_codes(code,user_id,created_at) VALUES(?,?,?)",
+                  (code, uid, dt.datetime.now().isoformat())); c.commit()
+    return code
+
+def resolve_link_code(code, chat_id, name=""):
+    with closing(db()) as c:
+        r = c.execute("SELECT user_id FROM link_codes WHERE code=?", (code.upper(),)).fetchone()
+        if not r:
+            return None
+        uid = r["user_id"]
+        c.execute("INSERT INTO telegram_links(chat_id,user_id,name,created_at) VALUES(?,?,?,?) "
+                  "ON CONFLICT(chat_id) DO UPDATE SET user_id=excluded.user_id",
+                  (str(chat_id), uid, name, dt.datetime.now().isoformat()))
+        c.execute("DELETE FROM link_codes WHERE code=?", (code.upper(),))
+        c.commit()
+    return uid
+
+def user_for_chat(chat_id):
+    with closing(db()) as c:
+        r = c.execute("SELECT user_id FROM telegram_links WHERE chat_id=?",
+                      (str(chat_id),)).fetchone()
+    return r["user_id"] if r else "local"
+
+def linked_chats():
+    with closing(db()) as c:
+        return [row_to_dict(r) for r in c.execute("SELECT * FROM telegram_links")]
+
+def _notified(uid, nkey):
+    with closing(db()) as c:
+        return c.execute("SELECT 1 FROM notified WHERE user_id=? AND nkey=?",
+                         (uid, nkey)).fetchone() is not None
+
+def _mark_notified(uid, nkey):
+    with closing(db()) as c:
+        c.execute("INSERT INTO notified(user_id,nkey,created_at) VALUES(?,?,?) "
+                  "ON CONFLICT DO NOTHING", (uid, nkey, dt.datetime.now().isoformat()))
+        c.commit()
+
+def brief_text(uid, name="there"):
+    b = build_brief(uid, name)
+    c = b["counts"]
+    lines = [b["greeting"],
+             f"{c['critical']} critical · {c['important']} important · {c['routine']} routine"]
+    if b["schedule"]:
+        lines.append("\nToday:")
+        lines += [f"  {s['time']}  {s['title']}" for s in b["schedule"][:8]]
+    if b["attention"]:
+        lines.append("\nNeeds your attention:")
+        lines += [f"  ⚠ {a}" for a in b["attention"][:6]]
+    return "\n".join(lines)
+
+def due_nudges(uid):
+    return [a for a in build_brief(uid)["attention"] if "overdue" in a]
+
+def proactive_loop():
+    """Background: message each linked Telegram chat their morning brief (at their
+    tz's brief hour, once/day) and any new overdue nudges."""
+    import time, telegram_bot
+    from zoneinfo import ZoneInfo
+    print("ATLAS proactive loop started.")
+    while True:
+        try:
+            for link in linked_chats():
+                uid, chat = link["user_id"], link["chat_id"]
+                name = link.get("name") or "there"
+                s = load_settings(uid)
+                try:
+                    now = dt.datetime.now(ZoneInfo(s.get("tz", "Asia/Kolkata")))
+                except Exception:
+                    now = dt.datetime.now()
+                hour = int(s.get("brief_hour", 8))
+                daykey = "brief-" + now.date().isoformat()
+                if now.hour == hour and not _notified(uid, daykey):
+                    telegram_bot.send(chat, brief_text(uid, name)); _mark_notified(uid, daykey)
+                for n in due_nudges(uid):
+                    nk = "nudge-" + now.date().isoformat() + "-" + n[:40]
+                    if not _notified(uid, nk):
+                        telegram_bot.send(chat, "🔔 " + n); _mark_notified(uid, nk)
+        except Exception as e:
+            print("proactive loop error:", e)
+        time.sleep(120)
+
 # ---- daily brief ----------------------------------------------------------
 def build_brief(uid="local", name="there"):
     spawn_recurring(uid)                       # keep recurring items materialized
@@ -766,7 +863,8 @@ def _maybe_start_telegram():
     if os.getenv("RUN_TELEGRAM_IN_WEB") == "1" and os.getenv("TELEGRAM_BOT_TOKEN"):
         import threading, telegram_bot
         threading.Thread(target=telegram_bot.run, daemon=True).start()
-        print("Telegram bot thread started.")
+        threading.Thread(target=proactive_loop, daemon=True).start()
+        print("Telegram bot + proactive loop started.")
 
 class CaptureIn(BaseModel): text: str
 
@@ -898,6 +996,11 @@ def api_memory(user=Depends(auth.current_user)):
 @app.delete("/api/memory/{mid}")
 def api_forget(mid: int, user=Depends(auth.current_user)):
     return forget_memory(user["id"], mid)
+
+@app.post("/api/link-code")
+def api_link_code(user=Depends(auth.current_user)):
+    """Generate a code the user sends to the Telegram bot as `/link CODE`."""
+    return {"code": make_link_code(user["id"])}
 
 @app.get("/api/recurring")
 def api_recurring(user=Depends(auth.current_user)):

@@ -238,6 +238,10 @@
       <div style="display:flex;gap:8px">
         <button class="mini ok" onclick="loadAvatar()">Load avatar</button>
         <button class="mini no" onclick="resetAvatar()">Holo-core</button></div>
+      <hr style="border:0;border-top:1px solid var(--line);margin:14px 0">
+      <label style="margin-bottom:6px">📲 Connect Telegram — get your daily brief & nudges on your phone</label>
+      <button class="mini ok" onclick="getLinkCode()">Get link code</button>
+      <div id="tgCode" class="muted" style="font-size:12px;margin-top:8px;word-break:break-all"></div>
     </div>
   </div>
 
@@ -282,6 +286,10 @@
       <button class="mini ok" onclick="doAuth('signin')">Sign in</button>
       <button class="mini no" onclick="doAuth('signup')">Create account</button>
     </div>
+    <div style="display:flex;align-items:center;gap:8px;margin:14px 0;color:var(--mut);font-size:11px">
+      <div style="flex:1;height:1px;background:var(--line)"></div>OR<div style="flex:1;height:1px;background:var(--line)"></div>
+    </div>
+    <button class="mini no" style="width:100%;padding:11px" onclick="googleSignIn()">Continue with Google</button>
     <div id="authMsg" class="authmsg"></div>
     <div class="authnote">Your tasks are private to your account.</div>
   </div>
@@ -296,8 +304,8 @@ const $=s=>document.querySelector(s);
 let AUTH_TOKEN=null, sb=null;
 function api(u,o){ o=o||{};
   if(AUTH_TOKEN) o.headers=Object.assign({},o.headers,{Authorization:'Bearer '+AUTH_TOKEN});
-  return fetch(u,o).then(r=>{ if(r.status===401){ showLogin(); throw new Error('unauthorized'); }
-    return r.json().catch(()=>({})); });
+  return fetch(u,o).then(r=>{ if(r.status===401){ AUTH_TOKEN=null; showLogin(); return null; }
+    return r.json().catch(()=>({})); }).catch(()=>null);
 }
 const DOT={critical:'var(--crit)',important:'var(--imp)',routine:'var(--rout)'};
 let history=[];
@@ -380,6 +388,9 @@ function loadAvatar(){ const url=$('#avatarUrl').value.trim();
   saveAvatarUrl(url);}
 function resetAvatar(){ window.ATLAS3D&&ATLAS3D.resetAvatar&&ATLAS3D.resetAvatar();
   $('#avatarUrl').value='';saveAvatarUrl('');window._avatarReq=false;toast('Back to the holo-core');}
+async function getLinkCode(){ try{ const r=await api('/api/link-code',{method:'POST'});
+  $('#tgCode').innerHTML='In Telegram, send your ATLAS bot:<br><b>/link '+r.code+'</b>'; }
+  catch(e){ $('#tgCode').textContent='Could not get a code — are you signed in?'; } }
 
 /* ===== proactive reminders ===== */
 let notifOn=false;const seenAttention=new Set();let primed=false;
@@ -425,6 +436,7 @@ async function handleUtterance(text){ if(!text||processing)return;
   bubbleMsg('me',text);history.push({role:'user',content:text});setState('thinking');saySoft('Working on it…');
   try{ const r=await api('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({messages:history})});
+    if(!r){bubbleMsg('at','Please sign in again.');saySoft('Please sign in again.');processing=false;setState('idle');return;}
     (r.actions||[]).forEach((a,idx)=>{if(a.pending)approvalCard(a);else setTimeout(()=>showActivity(a.tool),idx*400);});
     bubbleMsg('at',r.reply||'(no reply)');history.push({role:'assistant',content:r.reply||''});
     await refresh();processing=false;saySoft(r.reply||'');speak(r.reply);
@@ -432,7 +444,7 @@ async function handleUtterance(text){ if(!text||processing)return;
 function typed(){const i=$('#msg'),t=i.value.trim();if(!t)return;i.value='';handleUtterance(t);}
 
 /* ===== dashboard ===== */
-async function loadBrief(){const b=await api('/api/brief');$('#greet').textContent=b.greeting;
+async function loadBrief(){const b=await api('/api/brief');if(!b)return;$('#greet').textContent=b.greeting;
   if(b.avatar_url&&!window._avatarReq&&window.ATLAS3D&&ATLAS3D.loadAvatar){
     window._avatarReq=true; ATLAS3D.loadAvatar(b.avatar_url,ok=>ok&&toast('Avatar loaded ✨'));}
   const bd=$('#calbadge');bd.className='badge '+(b.calendar_connected?'on':'');
@@ -445,7 +457,7 @@ async function loadBrief(){const b=await api('/api/brief');$('#greet').textConte
   $('#attention').innerHTML=b.attention.length?b.attention.map(a=>
     `<li><span class="${a.includes('overdue')?'over':'warn'}">${esc(a)}</span></li>`).join('')
     :'<li class="muted">All clear. 🎉</li>';}
-async function loadItems(){const items=await api('/api/items?status=open');const top=items.filter(i=>!i.parent_id);
+async function loadItems(){const items=await api('/api/items?status=open');if(!items)return;const top=items.filter(i=>!i.parent_id);
   $('#items').innerHTML=top.length?top.map(i=>{const kids=items.filter(k=>k.parent_id===i.id);
     const meta=[i.type,i.deadline?('due '+i.deadline.slice(0,16).replace('T',' ')):null,i.google_event_id?'📅':null].filter(Boolean).join(' · ');
     const icon=i.type==='purchase'?'🛒 ':'';
@@ -460,13 +472,13 @@ async function done(id){await api('/api/items/'+id,{method:'PATCH',headers:{'Con
 async function del(id){await api('/api/items/'+id,{method:'DELETE'});refresh();}
 async function replan(){await api('/api/replan',{method:'POST'});showActivity('replan');toast('Re-planned');refresh();}
 async function loadMemory(){
-  const m=await api('/api/memory');
+  const m=await api('/api/memory');if(!m)return;
   $('#memory').innerHTML=m.length?m.map(x=>
     `<li><span class="grow">${esc(x.content)}</span><button class="ghost" onclick="forget(${x.id})">forget</button></li>`).join('')
     :'<li class="muted">Nothing yet — tell ATLAS about yourself.</li>';
 }
 async function loadRecurring(){
-  const r=await api('/api/recurring');
+  const r=await api('/api/recurring');if(!r)return;
   const human=x=>{const t=x.at_time?(' at '+x.at_time):'';
     if(x.rule==='daily')return 'Daily'+t;
     if(x.rule.startsWith('weekly:'))return x.rule.split(':')[1].replace(/,/g,'/')+t;
@@ -501,6 +513,12 @@ async function initAuth(){
 }
 function showLogin(){ const o=$('#authOverlay'); if(o)o.style.display='flex'; $('#signout').style.display='none'; }
 function hideLogin(){ const o=$('#authOverlay'); if(o)o.style.display='none'; $('#signout').style.display='inline-block'; }
+async function googleSignIn(){
+  if(!sb){$('#authMsg').textContent='Auth not ready.';return;}
+  const {error}=await sb.auth.signInWithOAuth({provider:'google',
+    options:{redirectTo:window.location.origin}});
+  if(error)$('#authMsg').textContent=error.message;
+}
 async function doAuth(mode){
   if(!sb)return; const email=$('#authEmail').value.trim(), password=$('#authPass').value;
   if(!email||!password){ $('#authMsg').textContent='Enter email and password.'; return; }
