@@ -31,7 +31,7 @@ import auth
 
 # ---- config ---------------------------------------------------------------
 DB_PATH = os.getenv("ATLAS_DB", str(Path(__file__).parent / "atlas.db"))
-MODEL = os.getenv("ATLAS_MODEL", "gemini-2.5-flash")   # Google Gemini (free tier)
+MODEL = os.getenv("ATLAS_MODEL", "gemini-flash-latest")   # Google Gemini (free tier)
 WORK_START, WORK_END = 9, 21
 BLOCK_MINUTES = 60
 FRONTEND = Path(__file__).parent.parent / "frontend"
