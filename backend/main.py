@@ -19,7 +19,7 @@ try:
 except ImportError:
     pass
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -27,6 +27,7 @@ from pydantic import BaseModel
 import calendar_client as gcal
 import gmail_client as gmail
 import web_client as web
+import auth
 
 # ---- config ---------------------------------------------------------------
 DB_PATH = os.getenv("ATLAS_DB", str(Path(__file__).parent / "atlas.db"))
@@ -60,6 +61,7 @@ def needs_approval(tool):
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL DEFAULT 'local',    -- owner account (per-user isolation)
   type TEXT NOT NULL,                       -- goal | task | commitment | event
   title TEXT NOT NULL,
   parent_id INTEGER,
@@ -84,6 +86,8 @@ def init_db():
         cols = [r[1] for r in c.execute("PRAGMA table_info(items)")]
         if "link" not in cols:                       # migrate older DBs
             c.execute("ALTER TABLE items ADD COLUMN link TEXT")
+        if "user_id" not in cols:
+            c.execute("ALTER TABLE items ADD COLUMN user_id TEXT NOT NULL DEFAULT 'local'")
         c.commit()
 
 def row_to_dict(r): return {k: r[k] for k in r.keys()}
@@ -134,7 +138,7 @@ def _sync_event(c, item_id, title, start, end, priority):
     except Exception as e:            # calendar issues never break capture
         print("calendar sync failed:", e)
 
-def store_items(parsed, source):
+def store_items(parsed, source, uid="local"):
     created = []; now = dt.datetime.now().isoformat()
     with closing(db()) as c:
         for it in parsed:
@@ -144,28 +148,29 @@ def store_items(parsed, source):
             if typ == "event" and parse_dt(dl) and "T" in (dl or ""):
                 ss = dl; se = (parse_dt(dl) + dt.timedelta(hours=1)).isoformat()
             cur = c.execute(
-                "INSERT INTO items(type,title,priority,deadline,scheduled_start,"
-                "scheduled_end,source_text,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (typ, it.get("title", "Untitled"), pri, dl, ss, se, source, now))
+                "INSERT INTO items(user_id,type,title,priority,deadline,scheduled_start,"
+                "scheduled_end,source_text,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (uid, typ, it.get("title", "Untitled"), pri, dl, ss, se, source, now))
             gid = cur.lastrowid; created.append(gid)
             if ss:
                 _sync_event(c, gid, it.get("title", "Event"), ss, se, pri)
             for st in (it.get("subtasks") or []):
                 title = st if isinstance(st, str) else st.get("title", "step")
                 c.execute(
-                    "INSERT INTO items(type,title,parent_id,priority,deadline,"
-                    "source_text,created_at) VALUES('task',?,?,?,?,?,?)",
-                    (title, gid, pri, dl, source, now))
+                    "INSERT INTO items(user_id,type,title,parent_id,priority,deadline,"
+                    "source_text,created_at) VALUES(?,'task',?,?,?,?,?,?)",
+                    (uid, title, gid, pri, dl, source, now))
         c.commit()
-    schedule_unplanned()
+    schedule_unplanned(uid)
     return created
 
 # ---- planner --------------------------------------------------------------
-def _busy(c, horizon_days=60):
-    """Busy intervals from local scheduled items + real Google Calendar."""
+def _busy(c, uid, horizon_days=60):
+    """Busy intervals from this user's scheduled items + real Google Calendar."""
     out = []
-    for r in c.execute("SELECT scheduled_start,scheduled_end FROM items "
-                       "WHERE scheduled_start IS NOT NULL AND status='open'"):
+    for r in c.execute("SELECT scheduled_start,scheduled_end FROM items WHERE "
+                       "user_id=? AND scheduled_start IS NOT NULL AND status='open'",
+                       (uid,)):
         s, e = parse_dt(r["scheduled_start"]), parse_dt(r["scheduled_end"])
         if s and e: out.append((s, e))
     if gcal.is_configured():
@@ -188,16 +193,16 @@ def _next_free_block(after, busy):
         t = end
     return t, t + dt.timedelta(minutes=BLOCK_MINUTES)
 
-def schedule_unplanned():
+def schedule_unplanned(uid="local"):
     """Give every open, unscheduled leaf task a work block before its deadline,
-    earliest-deadline-first, and push it to Google Calendar."""
+    earliest-deadline-first, and push it to Google Calendar. Scoped to one user."""
     with closing(db()) as c:
         tasks = c.execute(
-            "SELECT * FROM items WHERE type='task' AND status='open' "
+            "SELECT * FROM items WHERE user_id=? AND type='task' AND status='open' "
             "AND scheduled_start IS NULL "
             "AND id NOT IN (SELECT parent_id FROM items WHERE parent_id IS NOT NULL)"
-            " ORDER BY (deadline IS NULL), deadline").fetchall()
-        busy = _busy(c); cursor = dt.datetime.now()
+            " ORDER BY (deadline IS NULL), deadline", (uid,)).fetchall()
+        busy = _busy(c, uid); cursor = dt.datetime.now()
         for t in tasks:
             start, end = _next_free_block(cursor, busy)
             busy.append((start, end)); cursor = start
@@ -207,22 +212,54 @@ def schedule_unplanned():
                         end.isoformat(), t["priority"])
         c.commit()
 
-def _unsync(item_ids):
-    if not gcal.is_configured(): return
+def _unsync(uid, item_ids):
+    if not gcal.is_configured() or not item_ids: return
     with closing(db()) as c:
         q = ",".join("?" * len(item_ids))
-        for r in c.execute(f"SELECT google_event_id FROM items WHERE id IN ({q})"
-                           " AND google_event_id IS NOT NULL", item_ids):
+        for r in c.execute(f"SELECT google_event_id FROM items WHERE user_id=? AND "
+                           f"id IN ({q}) AND google_event_id IS NOT NULL",
+                           [uid, *item_ids]):
             try: gcal.delete_event(r["google_event_id"])
             except Exception as e: print("calendar delete failed:", e)
 
+# ---- per-user item operations (used by both the API and the agent) --------
+def list_items_for(uid, status="open"):
+    with closing(db()) as c:
+        rows = c.execute("SELECT * FROM items WHERE user_id=? AND status=? ORDER BY "
+                         "(deadline IS NULL), deadline, id", (uid, status)).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+def set_status(uid, item_id, status):
+    if status == "done":
+        with closing(db()) as c:
+            kids = [r["id"] for r in c.execute(
+                "SELECT id FROM items WHERE user_id=? AND parent_id=?", (uid, item_id))]
+        _unsync(uid, [item_id, *kids])
+    with closing(db()) as c:
+        c.execute("UPDATE items SET status=? WHERE user_id=? AND (id=? OR parent_id=?)",
+                  (status, uid, item_id, item_id))
+        c.commit()
+    schedule_unplanned(uid)
+    return {"ok": True}
+
+def remove_item(uid, item_id):
+    with closing(db()) as c:
+        kids = [r["id"] for r in c.execute(
+            "SELECT id FROM items WHERE user_id=? AND parent_id=?", (uid, item_id))]
+    _unsync(uid, [item_id, *kids])
+    with closing(db()) as c:
+        c.execute("DELETE FROM items WHERE user_id=? AND (id=? OR parent_id=?)",
+                  (uid, item_id, item_id))
+        c.commit()
+    return {"ok": True}
+
 # ---- daily brief ----------------------------------------------------------
-def build_brief():
+def build_brief(uid="local", name="there"):
     now = dt.datetime.now(); today = now.date()
     tomorrow = today + dt.timedelta(days=1)
     with closing(db()) as c:
         rows = [row_to_dict(r) for r in
-                c.execute("SELECT * FROM items WHERE status='open'")]
+                c.execute("SELECT * FROM items WHERE user_id=? AND status='open'", (uid,))]
     counts = {"critical": 0, "important": 0, "routine": 0}
     todays, attention, pending = [], [], []
     for r in rows:
@@ -246,7 +283,7 @@ def build_brief():
     av = load_settings().get("avatar_url")
     if not av and (FRONTEND / "avatar.glb").exists():
         av = "/static/avatar.glb"
-    return {"greeting": f"{greet}, Govind.", "date": today.isoformat(),
+    return {"greeting": f"{greet}, {name}.", "date": today.isoformat(),
             "counts": counts, "schedule": schedule,
             "attention": attention[:8], "pending": pending[:8],
             "calendar_connected": gcal.is_configured(), "avatar_url": av or ""}
@@ -313,20 +350,20 @@ class StatusIn(BaseModel): status: str
 def _plus_hour(s):
     return (parse_dt(s) + dt.timedelta(hours=1)).isoformat() if parse_dt(s) else s
 
-def run_tool(name, inp, approved=False):
+def run_tool(name, inp, uid="local", approved=False):
     if not approved and needs_approval(name):
         return {"pending": True, "tool": name, "input": inp,
                 "message": "Proposed — awaiting the user's approval."}
     try:
         if name == "capture":
             parsed = extract_items(inp["text"])
-            return {"created": len(store_items(parsed, inp["text"])), "items": parsed}
+            return {"created": len(store_items(parsed, inp["text"], uid)), "items": parsed}
         if name == "list_items":
-            return list_items()
+            return list_items_for(uid)
         if name == "complete_item":
-            return update_item(inp["id"], StatusIn(status="done"))
+            return set_status(uid, inp["id"], "done")
         if name == "get_brief":
-            return build_brief()
+            return build_brief(uid)
         if name == "create_calendar_event":
             if not gcal.is_configured():
                 return {"error": "Google Calendar not connected. Run authorize.py."}
@@ -335,10 +372,10 @@ def run_tool(name, inp, approved=False):
                                    inp.get("description", "ATLAS"))
             now = dt.datetime.now().isoformat()
             with closing(db()) as c:
-                c.execute("INSERT INTO items(type,title,priority,deadline,"
+                c.execute("INSERT INTO items(user_id,type,title,priority,deadline,"
                           "scheduled_start,scheduled_end,google_event_id,created_at)"
-                          " VALUES('event',?,'important',?,?,?,?,?)",
-                          (inp["title"], start, start, end, ev["id"], now))
+                          " VALUES(?,'event',?,'important',?,?,?,?,?)",
+                          (uid, inp["title"], start, start, end, ev["id"], now))
                 c.commit()
             return {"created": ev}
         if name == "list_calendar_events":
@@ -361,10 +398,10 @@ def run_tool(name, inp, approved=False):
         if name == "propose_purchase":
             now = dt.datetime.now().isoformat()
             with closing(db()) as c:
-                c.execute("INSERT INTO items(type,title,priority,status,link,"
-                          "source_text,created_at) VALUES('purchase',?,'important',"
+                c.execute("INSERT INTO items(user_id,type,title,priority,status,link,"
+                          "source_text,created_at) VALUES(?,'purchase',?,'important',"
                           "'open',?,?,?)",
-                          (inp["title"], inp.get("url"), inp.get("reason", ""), now))
+                          (uid, inp["title"], inp.get("url"), inp.get("reason", ""), now))
                 c.commit()
             return {"saved": inp["title"], "open_url": inp.get("url"),
                     "note": "Saved to your purchases. Opening the store so YOU can "
@@ -430,31 +467,58 @@ def _maybe_start_telegram():
 class CaptureIn(BaseModel): text: str
 
 @app.post("/api/capture")
-def capture(inp: CaptureIn):
+def capture(inp: CaptureIn, user=Depends(auth.current_user)):
     if not inp.text.strip(): raise HTTPException(400, "empty note")
-    parsed = extract_items(inp.text)
-    return {"created": store_items(parsed, inp.text), "items": parsed}
+    try:
+        parsed = extract_items(inp.text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(503, friendly_ai_error(e))
+    return {"created": store_items(parsed, inp.text, user["id"]), "items": parsed}
 
-def run_agent(messages: list[dict]) -> dict:
+def friendly_ai_error(e) -> str:
+    """Turn an Anthropic SDK exception into a clear message for the user."""
+    msg = str(e); low = msg.lower()
+    if "credit balance is too low" in low or "plans & billing" in low:
+        return ("⚠️ The AI is offline — this ATLAS instance's Anthropic API key has "
+                "no credits. Add credits at console.anthropic.com → Plans & Billing, "
+                "then try again.")
+    if "authentication" in low or "invalid x-api-key" in low or "401" in low:
+        return "⚠️ The AI key is missing or invalid. Set ANTHROPIC_API_KEY and restart."
+    if "rate limit" in low or "429" in low:
+        return "⚠️ Rate-limited by the AI provider. Give it a moment and retry."
+    if "overloaded" in low or "529" in low:
+        return "⚠️ The AI provider is overloaded right now. Please retry shortly."
+    return "⚠️ The AI request failed: " + msg[:200]
+
+def run_agent(messages: list[dict], uid="local", name="there") -> dict:
     """Shared agent loop used by the web chat AND the Telegram bot. Takes a
     conversation (list of {role, content}) and returns {reply, actions, pending}.
-    Pending actions are proposed-but-not-executed (permission tiers)."""
+    All tool actions are scoped to the given user (uid)."""
     import anthropic
-    client = anthropic.Anthropic()
-    sys = CHAT_SYS.format(user="Govind", tz=gcal.TZ,
+    try:
+        client = anthropic.Anthropic()
+    except Exception as e:
+        return {"reply": friendly_ai_error(e), "actions": [], "pending": []}
+    sys = CHAT_SYS.format(user=name, tz=gcal.TZ,
                           now=dt.datetime.now().isoformat(timespec="minutes"))
     msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
     actions = []
     for _ in range(8):   # room for multi-step research (search -> read -> answer)
-        resp = client.messages.create(model=MODEL, max_tokens=1500, system=sys,
-                                       tools=TOOLS, messages=msgs)
+        try:
+            resp = client.messages.create(model=MODEL, max_tokens=1500, system=sys,
+                                           tools=TOOLS, messages=msgs)
+        except Exception as e:
+            return {"reply": friendly_ai_error(e), "actions": actions,
+                    "pending": [a for a in actions if a["pending"]]}
         if resp.stop_reason == "tool_use":
             msgs.append({"role": "assistant",
                          "content": [b.model_dump() for b in resp.content]})
             results = []
             for blk in resp.content:
                 if blk.type == "tool_use":
-                    out = run_tool(blk.name, blk.input)
+                    out = run_tool(blk.name, blk.input, uid)
                     pend = isinstance(out, dict) and out.get("pending")
                     actions.append({"tool": blk.name, "input": blk.input,
                                     "pending": bool(pend)})
@@ -473,67 +537,54 @@ def run_agent(messages: list[dict]) -> dict:
             "Check your dashboard.", "actions": actions,
             "pending": [a for a in actions if a["pending"]]}
 
+def display_name(user):
+    return (user.get("email", "").split("@")[0] or "there") if user else "there"
+
+@app.get("/api/config")
+def config(): return auth.public_config()
+
 @app.post("/api/chat")
-def chat(inp: ChatIn):
-    return run_agent(inp.messages)
+def chat(inp: ChatIn, user=Depends(auth.current_user)):
+    return run_agent(inp.messages, user["id"], display_name(user))
 
 @app.get("/api/items")
-def list_items(status: str = "open"):
-    with closing(db()) as c:
-        rows = c.execute("SELECT * FROM items WHERE status=? ORDER BY "
-                         "(deadline IS NULL), deadline, id", (status,)).fetchall()
-    return [row_to_dict(r) for r in rows]
+def api_items(status: str = "open", user=Depends(auth.current_user)):
+    return list_items_for(user["id"], status)
 
 @app.patch("/api/items/{item_id}")
-def update_item(item_id: int, s: StatusIn):
-    if s.status == "done":
-        _unsync([item_id])
-        with closing(db()) as c:
-            kids = [r["id"] for r in c.execute(
-                "SELECT id FROM items WHERE parent_id=?", (item_id,))]
-        if kids: _unsync(kids)
-    with closing(db()) as c:
-        c.execute("UPDATE items SET status=? WHERE id=? OR parent_id=?",
-                  (s.status, item_id, item_id))
-        c.commit()
-    schedule_unplanned()
-    return {"ok": True}
+def api_update(item_id: int, s: StatusIn, user=Depends(auth.current_user)):
+    return set_status(user["id"], item_id, s.status)
 
 @app.delete("/api/items/{item_id}")
-def delete_item(item_id: int):
-    _unsync([item_id])
-    with closing(db()) as c:
-        kids = [r["id"] for r in
-                c.execute("SELECT id FROM items WHERE parent_id=?", (item_id,))]
-        if kids: _unsync(kids)
-        c.execute("DELETE FROM items WHERE id=? OR parent_id=?", (item_id, item_id))
-        c.commit()
-    return {"ok": True}
+def api_delete(item_id: int, user=Depends(auth.current_user)):
+    return remove_item(user["id"], item_id)
 
 @app.post("/api/replan")
-def replan(): schedule_unplanned(); return {"ok": True}
+def replan(user=Depends(auth.current_user)):
+    schedule_unplanned(user["id"]); return {"ok": True}
 
 class ExecIn(BaseModel):
     tool: str
     input: dict
 
 @app.post("/api/execute")
-def execute(inp: ExecIn):
+def execute(inp: ExecIn, user=Depends(auth.current_user)):
     """Run a previously proposed action after the user approves it in the UI."""
-    return {"result": run_tool(inp.tool, inp.input, approved=True)}
+    return {"result": run_tool(inp.tool, inp.input, user["id"], approved=True)}
 
 class SettingsIn(BaseModel):
     settings: dict
 
 @app.get("/api/settings")
-def get_settings(): return load_settings()
+def get_settings(user=Depends(auth.current_user)): return load_settings()
 
 @app.put("/api/settings")
-def put_settings(s: SettingsIn):
+def put_settings(s: SettingsIn, user=Depends(auth.current_user)):
     cur = load_settings(); cur.update(s.settings); save_settings(cur); return cur
 
 @app.get("/api/brief")
-def brief(): return build_brief()
+def brief(user=Depends(auth.current_user)):
+    return build_brief(user["id"], display_name(user))
 
 @app.get("/")
 def index(): return FileResponse(FRONTEND / "index.html")
