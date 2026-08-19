@@ -20,7 +20,8 @@ TOKEN = BASE / "token.json"            # created by authorize.py
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/gmail.readonly",   # read inbox
-    "https://www.googleapis.com/auth/gmail.compose",    # create DRAFTS (never auto-send)
+    "https://www.googleapis.com/auth/gmail.compose",    # create DRAFTS
+    "https://www.googleapis.com/auth/gmail.send",       # send mail (approval-gated in app)
 ]
 CAL_ID = os.getenv("ATLAS_CALENDAR_ID", "primary")
 TZ = os.getenv("ATLAS_TZ", "Asia/Kolkata")

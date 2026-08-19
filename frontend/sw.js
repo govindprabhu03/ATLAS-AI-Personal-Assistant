@@ -1,5 +1,5 @@
 /* ATLAS service worker — fresh UI (network-first HTML), offline-capable shell. */
-const CACHE = 'atlas-v10';
+const CACHE = 'atlas-v14';
 const SHELL = ['/', '/static/icon-192.png', '/static/icon-512.png',
                '/manifest.webmanifest'];
 

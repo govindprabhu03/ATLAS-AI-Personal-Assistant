@@ -41,3 +41,20 @@ def create_draft(to: str, subject: str, body: str) -> dict:
         userId="me", body={"message": {"raw": raw}}).execute()
     return {"draft_id": d["id"], "to": to, "subject": subject,
             "note": "Draft saved in Gmail — review and send it yourself."}
+
+
+def send_email(to: str, subject: str, body: str, cc: str = "", bcc: str = "") -> dict:
+    """Actually send an email from the user's Gmail. Gated behind approval in the
+    app (ATLAS proposes it and only sends after the user clicks Approve)."""
+    mime = MIMEText(body)
+    mime["to"] = to
+    mime["subject"] = subject
+    if cc:
+        mime["cc"] = cc
+    if bcc:
+        mime["bcc"] = bcc
+    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+    sent = _service().users().messages().send(
+        userId="me", body={"raw": raw}).execute()
+    return {"sent": True, "message_id": sent.get("id"), "to": to,
+            "subject": subject, "note": "Email sent from your Gmail."}

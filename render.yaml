@@ -45,6 +45,16 @@ services:
         sync: false
       - key: RUN_TELEGRAM_IN_WEB
         value: "1"
+      # Phone calls (optional) — Twilio (console.twilio.com). PUBLIC_BASE_URL must
+      # be this service's public URL so Twilio can fetch the call audio/TwiML.
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM_NUMBER
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
       # Web-push (optional). Auto-generated if unset, but Render's disk is
       # ephemeral so set a fixed pair here to keep subscriptions valid across
       # deploys. Generate once: python -c "import push,json;print(json.dumps(push.keys()))"

@@ -117,6 +117,10 @@
   .permpop label{display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:var(--mut);margin-bottom:12px}
   .permpop select{background:rgba(8,14,30,.9);border:1px solid var(--line);color:var(--fg);border-radius:9px;
     padding:8px;font:inherit}
+  .prow{display:flex;justify-content:space-between;gap:12px;padding:6px 0;font-size:12.5px;align-items:center;
+    border-bottom:1px solid rgba(255,255,255,.05)}
+  .prow b{font-weight:600;word-break:break-all;text-align:right}
+  .pill-on{color:var(--rout)} .pill-off{color:var(--mut)}
 
   /* dashboard */
   .grid{display:grid;grid-template-columns:1.3fr 1fr 1fr;gap:16px;margin-top:18px}
@@ -212,13 +216,22 @@
 <div class="wrap">
   <div class="topbar">
     <div class="logo">ATLAS</div>
-    <span class="badge" id="calbadge">google: …</span>
+    <button class="badge btn" id="calbadge" onclick="calbadgeClick()">google: …</button>
     <button class="badge btn" id="bell" onclick="enableReminders()">🔔 Reminders off</button>
     <button class="badge btn" onclick="togglePerms()">⚙ Permissions</button>
     <button class="badge btn" id="install" style="display:none" onclick="installApp()">⬇ Install</button>
-    <button class="badge btn" id="signout" style="display:none" onclick="signOut()">Sign out</button>
     <div style="flex:1"></div>
     <span class="badge">PLAN · EXECUTE · FOLLOW UP</span>
+    <button class="badge btn" id="loginBtn" style="display:none" onclick="showLogin()">Log in</button>
+    <button class="badge btn" id="profile" style="display:none" onclick="toggleProfile()">👤 Profile</button>
+    <div id="profilePop" class="permpop" hidden>
+      <h3>Your profile</h3>
+      <div class="prow"><span class="muted">Signed in as</span><b id="profEmail">—</b></div>
+      <div class="prow"><span class="muted">Google (Calendar &amp; Gmail)</span><span id="profGoogle">—</span></div>
+      <div class="prow"><span class="muted">Phone calling</span><span id="profCalling">—</span></div>
+      <div class="prow"><span class="muted">Storage</span><span id="profDb">—</span></div>
+      <button class="mini no" style="width:100%;margin-top:10px" onclick="signOut()">Log out</button>
+    </div>
     <div id="perms" class="permpop" hidden>
       <h3>What can ATLAS do on its own?</h3>
       <label>Create calendar events
@@ -273,6 +286,21 @@
       <ul id="items"></ul></div>
     <div class="panel"><h2>🧠 ATLAS remembers</h2><ul id="memory"></ul></div>
     <div class="panel"><h2>🔁 Recurring</h2><ul id="recurring"></ul></div>
+    <div class="panel span2"><h2>📞 Calls &amp; recordings <span id="callBadge" class="muted" style="float:right;font-size:11px"></span></h2>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+        <input id="recName" placeholder="Name (e.g. Reminder to Mom)" style="flex:1;min-width:120px">
+        <select id="recKind" onchange="recKindChange()">
+          <option value="tts">Spoken text</option>
+          <option value="audio">Audio file</option>
+        </select>
+        <input id="recText" placeholder="Message ATLAS will speak…" style="flex:2;min-width:140px">
+        <input id="recFile" type="file" accept="audio/*" style="display:none">
+        <button class="ghost" onclick="saveRecording()">Save</button>
+      </div>
+      <ul id="recordings"></ul>
+      <div class="muted" style="font-size:11px;margin:6px 2px 2px">Recent calls</div>
+      <ul id="callhistory"></ul>
+    </div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -316,7 +344,7 @@
 <script src="/static/scene.js"></script>
 <script>
 const $=s=>document.querySelector(s);
-let AUTH_TOKEN=null, sb=null;
+let AUTH_TOKEN=null, sb=null, USER_EMAIL=null, GOOGLE_OK=false, APP_DB='';
 function api(u,o){ o=o||{};
   if(AUTH_TOKEN) o.headers=Object.assign({},o.headers,{Authorization:'Bearer '+AUTH_TOKEN});
   return fetch(u,o).then(r=>{ if(r.status===401){ AUTH_TOKEN=null; showLogin(); return null; }
@@ -349,12 +377,14 @@ function saySoft(text){ const el=$('#bubbletext'); el.textContent=''; let i=0;
 const ACT={
   capture:{i:'🗂️',t:'Planning tasks'}, create_calendar_event:{i:'📅',t:'Calendar'},
   list_calendar_events:{i:'📅',t:'Reading calendar'}, check_email:{i:'📧',t:'Scanning inbox'},
-  draft_email:{i:'✉️',t:'Drafting reply'}, get_brief:{i:'📋',t:'Reviewing day'},
+  draft_email:{i:'✉️',t:'Drafting reply'}, send_email:{i:'📨',t:'Sending email'},
+  get_brief:{i:'📋',t:'Reviewing day'},
   complete_item:{i:'✅',t:'Marking done'}, list_items:{i:'🗂️',t:'Checking tasks'},
   web_search:{i:'🔎',t:'Searching web'}, web_read:{i:'📄',t:'Reading page'},
   propose_purchase:{i:'🛒',t:'Preparing buy'}, replan:{i:'🧭',t:'Re-planning'},
   remember:{i:'🧠',t:'Remembering'}, add_recurring:{i:'🔁',t:'Setting recurring'},
   list_recurring:{i:'🔁',t:'Checking recurring'},
+  place_call:{i:'📞',t:'Placing call'}, list_recordings:{i:'📼',t:'Recordings'},
 };
 function showActivity(tool){const a=ACT[tool]||{i:'⚙️',t:tool};
   window.ATLAS3D&&ATLAS3D.spawnActivity(a.i,a.t);}
@@ -362,7 +392,9 @@ function showActivity(tool){const a=ACT[tool]||{i:'⚙️',t:tool};
 /* ===== approval cards (permission tiers) ===== */
 function actDesc(tool,inp){
   if(tool==='create_calendar_event')return `${inp.title||''} · ${(inp.start||'').replace('T',' ')}`;
-  if(tool==='draft_email')return `To ${inp.to||'?'} · ${inp.subject||''}`;
+  if(tool==='draft_email')return `Draft to ${inp.to||'?'} · ${inp.subject||''}`;
+  if(tool==='send_email')return `Send to ${inp.to||'?'} · ${inp.subject||''}${inp.cc?' · cc '+inp.cc:''}`;
+  if(tool==='place_call')return `Call ${inp.to||'?'} · ${inp.recording_name?('plays "'+inp.recording_name+'"'):('says "'+(inp.say||'').slice(0,40)+'"')}`;
   if(tool==='propose_purchase')return `${inp.title||''}${inp.price?' · '+inp.price:''} — ATLAS won't pay; opens the store`;
   return JSON.stringify(inp);
 }
@@ -489,8 +521,10 @@ function typed(){const i=$('#msg'),t=i.value.trim();if(!t)return;i.value='';hand
 async function loadBrief(){const b=await api('/api/brief');if(!b)return;$('#greet').textContent=b.greeting;
   if(b.avatar_url&&!window._avatarReq&&window.ATLAS3D&&ATLAS3D.loadAvatar){
     window._avatarReq=true; ATLAS3D.loadAvatar(b.avatar_url,ok=>ok&&toast('Avatar loaded ✨'));}
-  const bd=$('#calbadge');bd.className='badge '+(b.calendar_connected?'on':'');
-  bd.textContent=b.calendar_connected?'google: connected':'google: not connected';
+  GOOGLE_OK=!!b.calendar_connected;
+  const bd=$('#calbadge');bd.className='badge btn '+(GOOGLE_OK?'on':'');
+  bd.textContent=GOOGLE_OK?'google: connected':'🔗 Connect Google';
+  syncProfile();
   $('#counts').innerHTML=['critical','important','routine'].map(k=>
     `<div class="pill"><b class="c-${k}">${b.counts[k]||0}</b>${k}</div>`).join('');
   $('#schedule').innerHTML=b.schedule.length?b.schedule.map(s=>
@@ -532,7 +566,41 @@ async function loadRecurring(){
 }
 async function forget(id){await api('/api/memory/'+id,{method:'DELETE'});toast('Forgotten');loadMemory();}
 async function removeRecurring(id){await api('/api/recurring/'+id,{method:'DELETE'});toast('Removed');refresh();}
-async function refresh(){await Promise.all([loadBrief(),loadItems(),loadMemory(),loadRecurring()]);}
+
+/* ===== calls & recordings ===== */
+let CALLING_OK=false;
+function recKindChange(){ const k=$('#recKind').value;
+  $('#recText').style.display=k==='tts'?'':'none';
+  $('#recFile').style.display=k==='audio'?'':'none';
+}
+function fileToB64(f){return new Promise((res,rej)=>{const r=new FileReader();
+  r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(f);});}
+async function saveRecording(){
+  const name=$('#recName').value.trim(); const kind=$('#recKind').value;
+  if(!name){toast('Give it a name');return;}
+  let body={name,kind};
+  if(kind==='tts'){ const t=$('#recText').value.trim(); if(!t){toast('Type the message');return;} body.text=t; }
+  else { const f=$('#recFile').files[0]; if(!f){toast('Choose an audio file');return;}
+    if(f.size>8*1024*1024){toast('Audio too large (max 8 MB)');return;}
+    body.audio_b64=await fileToB64(f); body.mime=f.type; }
+  const r=await api('/api/recordings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(r&&r.id){toast('Saved');$('#recName').value='';$('#recText').value='';$('#recFile').value='';loadCalls();}
+  else toast('Could not save');
+}
+async function deleteRecording(id){await api('/api/recordings/'+id,{method:'DELETE'});toast('Deleted');loadCalls();}
+async function loadCalls(){
+  $('#callBadge').textContent = CALLING_OK ? '● calling connected' : '○ calling not set up';
+  $('#callBadge').style.color = CALLING_OK ? 'var(--rout)' : '';
+  const recs=await api('/api/recordings');
+  if(recs) $('#recordings').innerHTML = recs.length ? recs.map(x=>
+    `<li><span class="grow">${esc(x.name)} <span class="muted" style="font-size:11px">· ${x.kind==='audio'?'🎵 audio':'🗣 spoken'}</span>${x.kind==='audio'&&x.media_token?` <audio controls preload="none" src="/media/recordings/${encodeURIComponent(x.media_token)}" style="height:26px;vertical-align:middle"></audio>`:''}</span><button class="ghost" onclick="deleteRecording(${x.id})">✕</button></li>`).join('')
+    : '<li class="muted">No recordings yet. Save a spoken message or upload an audio clip, then say “ATLAS, call …”.</li>';
+  const hist=await api('/api/calls');
+  if(hist) $('#callhistory').innerHTML = hist.length ? hist.map(x=>
+    `<li><span class="grow">${esc(x.to_number)} <span class="muted" style="font-size:11px">· ${esc(x.status||'')}${x.error?(' — '+esc(x.error)):''}</span></span></li>`).join('')
+    : '<li class="muted">No calls yet.</li>';
+}
+async function refresh(){await Promise.all([loadBrief(),loadItems(),loadMemory(),loadRecurring(),loadCalls()]);}
 
 /* ===== boot ===== */
 let _appStarted=false;
@@ -543,18 +611,43 @@ function startApp(){
   setTimeout(()=>{speaking=false;setState('idle');},4600);
   refresh().then(pollReminders).then(checkOnboarding); setInterval(pollReminders,60000);
 }
+function handleGoogleReturn(){
+  const p=new URLSearchParams(location.search);
+  if(p.get('google')==='connected'){ toast('✅ Google connected'); }
+  else if(p.get('google')==='error'){ toast('Google connect failed: '+(p.get('msg')||'error')); }
+  if(p.has('google')){ history.replaceState({},'',location.pathname); }
+}
 async function initAuth(){
+  handleGoogleReturn();
   let cfg; try{ cfg=await fetch('/api/config').then(r=>r.json()); }catch(e){ cfg={auth_required:false}; }
+  CALLING_OK=!!cfg.calling_connected; APP_DB=cfg.db||'';
   if(!cfg.auth_required){ startApp(); return; }              // local/dev: no login
   if(!window.supabase){ $('#authMsg').textContent='Auth library failed to load.'; showLogin(); return; }
   sb=window.supabase.createClient(cfg.supabase_url, cfg.supabase_anon_key);
   const {data}=await sb.auth.getSession();
-  if(data && data.session){ AUTH_TOKEN=data.session.access_token; hideLogin(); startApp(); }
+  if(data && data.session){ AUTH_TOKEN=data.session.access_token;
+    USER_EMAIL=(data.session.user&&data.session.user.email)||null; hideLogin(); startApp(); }
   else showLogin();
-  sb.auth.onAuthStateChange((_e,session)=>{ if(session) AUTH_TOKEN=session.access_token; });
+  sb.auth.onAuthStateChange((_e,session)=>{ if(session){ AUTH_TOKEN=session.access_token;
+    USER_EMAIL=(session.user&&session.user.email)||USER_EMAIL; syncProfile(); } });
 }
-function showLogin(){ const o=$('#authOverlay'); if(o)o.style.display='flex'; $('#signout').style.display='none'; }
-function hideLogin(){ const o=$('#authOverlay'); if(o)o.style.display='none'; $('#signout').style.display='inline-block'; }
+function showLogin(){ const o=$('#authOverlay'); if(o)o.style.display='flex';
+  $('#profile').style.display='none'; const pp=$('#profilePop'); if(pp)pp.hidden=true;
+  $('#loginBtn').style.display='inline-block'; }
+function hideLogin(){ const o=$('#authOverlay'); if(o)o.style.display='none';
+  $('#profile').style.display='inline-block'; $('#loginBtn').style.display='none'; syncProfile(); }
+function toggleProfile(){ const p=$('#profilePop'); if(!p)return; p.hidden=!p.hidden; if(!p.hidden)syncProfile(); }
+function syncProfile(){
+  const e=$('#profEmail'); if(e)e.textContent=USER_EMAIL||'Local user';
+  const g=$('#profGoogle'); if(g){g.textContent=GOOGLE_OK?'Connected':'Not connected';g.className=GOOGLE_OK?'pill-on':'pill-off';}
+  const c=$('#profCalling'); if(c){c.textContent=CALLING_OK?'Connected':'Not set up';c.className=CALLING_OK?'pill-on':'pill-off';}
+  const d=$('#profDb'); if(d)d.textContent=APP_DB||'—';
+}
+function calbadgeClick(){
+  if(GOOGLE_OK){ toast('Google already connected'); return; }
+  toast('Opening Google sign-in…'); connectGoogle();
+}
+function connectGoogle(){ window.location.href='/api/google/start'; }
 async function googleSignIn(){
   if(!sb){$('#authMsg').textContent='Auth not ready.';return;}
   const {error}=await sb.auth.signInWithOAuth({provider:'google',

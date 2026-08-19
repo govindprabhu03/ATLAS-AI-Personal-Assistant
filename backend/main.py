@@ -19,14 +19,20 @@ try:
 except ImportError:
     pass
 
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+# Google sometimes returns scopes in a different order / adds 'openid'; relax so
+# the OAuth library doesn't reject the token exchange over a harmless scope diff.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+from urllib.parse import quote as _q
 
 import calendar_client as gcal
 import gmail_client as gmail
 import web_client as web
+import call_client as calls
 import auth
 import store
 import push
@@ -41,9 +47,13 @@ FRONTEND = Path(__file__).parent.parent / "frontend"
 # Outward/side-effecting tools default to "ask" (require user approval).
 # Levels: "auto" (do it) | "ask" (propose, wait for Approve in the UI).
 DEFAULT_SETTINGS = {"create_calendar_event": "ask", "draft_email": "ask",
+                    "send_email": "ask", "place_call": "ask",
                     "tz": os.getenv("ATLAS_TZ", "Asia/Kolkata"), "avatar_url": ""}
-# Purchases ALWAYS require approval and can never be set to auto — ATLAS never pays.
-ALWAYS_ASK = {"propose_purchase"}
+# These ALWAYS require approval and can never be set to auto:
+#  - propose_purchase: ATLAS never pays.
+#  - send_email: sending mail is irreversible + outward-facing, so always confirm.
+#  - place_call: dialling a real person is irreversible + outward, so always confirm.
+ALWAYS_ASK = {"propose_purchase", "send_email", "place_call"}
 
 def load_settings(uid="local"):
     """Per-user settings (permissions, timezone, avatar) stored in the DB."""
@@ -122,6 +132,32 @@ CREATE TABLE IF NOT EXISTS notified(
 CREATE TABLE IF NOT EXISTS push_subs(
   endpoint TEXT PRIMARY KEY, user_id TEXT NOT NULL, sub TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS recordings(
+  id {pk},
+  user_id TEXT NOT NULL DEFAULT 'local',
+  name TEXT NOT NULL,                        -- label the user gives the clip/message
+  kind TEXT NOT NULL,                        -- 'audio' (uploaded clip) | 'tts' (spoken text)
+  mime TEXT,                                 -- audio content-type (for kind='audio')
+  media_token TEXT,                          -- unguessable public URL id for the clip
+  audio_b64 TEXT,                            -- clip bytes, base64 in DB (durable, deploy-safe)
+  text TEXT,                                 -- message to speak (for kind='tts')
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS call_jobs(
+  token TEXT PRIMARY KEY,                    -- unguessable id, also the TwiML URL path
+  user_id TEXT NOT NULL DEFAULT 'local',
+  to_number TEXT NOT NULL,
+  recording_id INTEGER,                      -- clip to play, or NULL if speaking text
+  say_text TEXT,                             -- text to speak when no recording
+  status TEXT DEFAULT 'queued',              -- queued | dialing | failed
+  call_sid TEXT,                             -- Twilio call id once placed
+  error TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS app_secrets(
+  skey TEXT PRIMARY KEY,                     -- e.g. 'google_token' (durable across restarts)
+  value TEXT NOT NULL
+);
 """
 
 db = store.connect          # returns a connection wrapper (SQLite or Postgres)
@@ -143,9 +179,120 @@ def init_db():
 
 def row_to_dict(r): return dict(r)
 
+def get_secret(key):
+    try:
+        with closing(db()) as c:
+            r = c.execute("SELECT value FROM app_secrets WHERE skey=?", (key,)).fetchone()
+        return r["value"] if r else None
+    except Exception:
+        return None
+
+def set_secret(key, value):
+    with closing(db()) as c:
+        if store.is_postgres():
+            c.execute("INSERT INTO app_secrets(skey,value) VALUES(?,?) ON CONFLICT(skey) "
+                      "DO UPDATE SET value=EXCLUDED.value", (key, value))
+        else:
+            c.execute("INSERT OR REPLACE INTO app_secrets(skey,value) VALUES(?,?)", (key, value))
+        c.commit()
+
 def parse_dt(x):
     try: return dt.datetime.fromisoformat(x) if x else None
     except (TypeError, ValueError): return None
+
+# ---- recordings library + call jobs ---------------------------------------
+# Audio clips are stored base64 IN THE DB (not on disk) so they survive restarts
+# and work on ephemeral-disk hosts like Render free tier.
+import base64, secrets
+_REC_COLS = "id,name,kind,mime,media_token,text,created_at"   # never selects audio_b64 (big)
+
+def add_recording(uid, name, kind, text=None, audio_b64=None, mime=None):
+    """Save a call recording. kind='audio' stores an uploaded clip (base64 in DB);
+    kind='tts' stores text ATLAS will speak."""
+    now = dt.datetime.now().isoformat()
+    token = clean = None
+    if kind == "audio":
+        if not audio_b64:
+            raise HTTPException(400, "audio data required")
+        clean = audio_b64.split(",", 1)[-1]                   # tolerate data: URLs
+        try:
+            raw = base64.b64decode(clean, validate=False)
+        except Exception:
+            raise HTTPException(400, "invalid audio data")
+        if len(raw) > 8 * 1024 * 1024:
+            raise HTTPException(400, "audio too large (max 8 MB)")
+        token = secrets.token_urlsafe(12)
+    with closing(db()) as c:
+        rid = c.insert("INSERT INTO recordings(user_id,name,kind,mime,media_token,"
+                       "audio_b64,text,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                       (uid, name, kind, mime, token, clean, text, now))
+        c.commit()
+    return {"id": rid, "name": name, "kind": kind, "media_token": token}
+
+def list_recordings(uid):
+    with closing(db()) as c:
+        rows = c.execute(f"SELECT {_REC_COLS} FROM recordings"
+                         " WHERE user_id=? ORDER BY id DESC", (uid,)).fetchall()
+    return [dict(r) for r in rows]
+
+def get_recording(uid, rid):
+    with closing(db()) as c:
+        r = c.execute(f"SELECT {_REC_COLS} FROM recordings"
+                      " WHERE user_id=? AND id=?", (uid, rid)).fetchone()
+    return dict(r) if r else None
+
+def find_recording_by_name(uid, name):
+    with closing(db()) as c:
+        r = c.execute(f"SELECT {_REC_COLS} FROM recordings"
+                      " WHERE user_id=? AND lower(name)=lower(?) ORDER BY id DESC LIMIT 1",
+                      (uid, name)).fetchone()
+    return dict(r) if r else None
+
+def recording_audio(media_token):
+    """Return (bytes, mime) for a stored audio clip, or None. Public lookup by
+    unguessable token (Twilio + the in-app <audio> player fetch this)."""
+    with closing(db()) as c:
+        r = c.execute("SELECT audio_b64,mime FROM recordings WHERE media_token=?",
+                      (media_token,)).fetchone()
+    if not r or not r["audio_b64"]:
+        return None
+    try:
+        return base64.b64decode(r["audio_b64"]), (r["mime"] or "audio/mpeg")
+    except Exception:
+        return None
+
+def delete_recording(uid, rid):
+    with closing(db()) as c:
+        c.execute("DELETE FROM recordings WHERE user_id=? AND id=?", (uid, rid)); c.commit()
+    return {"deleted": rid}
+
+def create_call_job(uid, to, recording_id=None, say_text=None):
+    token = secrets.token_urlsafe(16)
+    now = dt.datetime.now().isoformat()
+    with closing(db()) as c:
+        c.execute("INSERT INTO call_jobs(token,user_id,to_number,recording_id,say_text,"
+                  "status,created_at) VALUES(?,?,?,?,?, 'queued',?)",
+                  (token, uid, to, recording_id, say_text, now)); c.commit()
+    return token
+
+def get_call_job(token):
+    with closing(db()) as c:
+        r = c.execute("SELECT * FROM call_jobs WHERE token=?", (token,)).fetchone()
+    return dict(r) if r else None
+
+def set_call_job(token, **fields):
+    if not fields: return
+    cols = ",".join(f"{k}=?" for k in fields)
+    with closing(db()) as c:
+        c.execute(f"UPDATE call_jobs SET {cols} WHERE token=?",
+                  (*fields.values(), token)); c.commit()
+
+def list_call_history(uid, limit=20):
+    with closing(db()) as c:
+        rows = c.execute("SELECT token,to_number,recording_id,say_text,status,error,"
+                         "created_at FROM call_jobs WHERE user_id=? ORDER BY created_at "
+                         "DESC LIMIT ?", (uid, limit)).fetchall()
+    return [dict(r) for r in rows]
 
 # ---- llm extraction -------------------------------------------------------
 EXTRACT_SYS = """You are the intake brain of ATLAS, a personal AI manager. Read \
@@ -716,10 +863,35 @@ TOOLS = [
       "query": {"type": "string", "description": "Gmail search, default is:unread newer_than:7d"},
       "max": {"type": "integer"}}}},
  {"name": "draft_email", "description": "Create a DRAFT email/reply in the user's "
-  "Gmail for them to review and send. NEVER sends automatically.",
+  "Gmail for them to review and send. Use when the user wants to review before "
+  "sending, or is unsure.",
   "input_schema": {"type": "object", "properties": {
       "to": {"type": "string"}, "subject": {"type": "string"},
       "body": {"type": "string"}}, "required": ["to", "subject", "body"]}},
+ {"name": "send_email", "description": "Actually SEND an email from the user's "
+  "Gmail. Use when the user clearly asks to send/email something. The app always "
+  "shows the user an Approve/Cancel card first, so it only sends after they "
+  "confirm — you do not need to ask for confirmation yourself, just call it.",
+  "input_schema": {"type": "object", "properties": {
+      "to": {"type": "string"}, "subject": {"type": "string"},
+      "body": {"type": "string"},
+      "cc": {"type": "string"}, "bcc": {"type": "string"}},
+      "required": ["to", "subject", "body"]}},
+ {"name": "place_call", "description": "Place a real phone call from the user's "
+  "ATLAS number to a person, when the user asks you to call someone. When they "
+  "answer, ATLAS plays either a saved recording (pass recording_name or "
+  "recording_id) or speaks a message (pass say). The app shows an Approve/Cancel "
+  "card before dialling, so just call the tool; don't ask 'should I call?' "
+  "yourself. Give the number in international E.164 form if the user provides it.",
+  "input_schema": {"type": "object", "properties": {
+      "to": {"type": "string", "description": "phone number to call, E.164 e.g. +919876543210"},
+      "recording_name": {"type": "string", "description": "name of a saved recording to play"},
+      "recording_id": {"type": "integer", "description": "id of a saved recording to play"},
+      "say": {"type": "string", "description": "message to speak aloud if no recording is chosen"}},
+      "required": ["to"]}},
+ {"name": "list_recordings", "description": "List the user's saved call recordings "
+  "and spoken-message templates (name + kind), e.g. before placing a call.",
+  "input_schema": {"type": "object", "properties": {}}},
  {"name": "web_search", "description": "Search the live web for current info — "
   "products, prices, reviews, places, facts. Returns title, url, snippet for the "
   "top results. Use this first for any 'find / compare / recommend' request.",
@@ -801,7 +973,7 @@ def run_tool(name, inp, uid="local", approved=False):
             return build_brief(uid)
         if name == "create_calendar_event":
             if not gcal.is_configured():
-                return {"error": "Google Calendar not connected. Run authorize.py."}
+                return {"error": "Google Calendar not connected. Click ‘Connect Google’ in the app."}
             start = inp["start"]; end = inp.get("end") or _plus_hour(start)
             ev = gcal.create_event(inp["title"], start, end,
                                    inp.get("description", "ATLAS"))
@@ -826,6 +998,36 @@ def run_tool(name, inp, uid="local", approved=False):
             if not gcal.is_configured():
                 return {"error": "Google account not connected."}
             return gmail.create_draft(inp["to"], inp["subject"], inp["body"])
+        if name == "send_email":
+            if not gcal.is_configured():
+                return {"error": "Google account not connected."}
+            return gmail.send_email(inp["to"], inp["subject"], inp["body"],
+                                    inp.get("cc", ""), inp.get("bcc", ""))
+        if name == "list_recordings":
+            return list_recordings(uid)
+        if name == "place_call":
+            if not calls.is_configured():
+                return {"error": calls.why_not_configured() or "Calling not connected."}
+            rec = None
+            if inp.get("recording_id"):
+                rec = get_recording(uid, inp["recording_id"])
+            elif inp.get("recording_name"):
+                rec = find_recording_by_name(uid, inp["recording_name"])
+            say = inp.get("say")
+            if not rec and not say:
+                return {"error": "Pick a saved recording or provide a message to say."}
+            token = create_call_job(uid, inp["to"],
+                                    rec["id"] if rec else None,
+                                    None if rec else say)
+            twiml_url = f"{calls.public_base()}/api/twiml/{token}"
+            try:
+                res = calls.place_call(inp["to"], twiml_url)
+            except Exception as e:
+                set_call_job(token, status="failed", error=str(e)[:300])
+                return {"error": str(e)[:300]}
+            set_call_job(token, status="dialing", call_sid=res.get("call_sid"))
+            return {"calling": inp["to"], "status": res.get("status"),
+                    "plays": rec["name"] if rec else f"message: {say[:60]}"}
         if name == "web_search":
             return web.search(inp["query"], inp.get("count", 6))
         if name == "web_read":
@@ -885,8 +1087,15 @@ Use your tools to ACTUALLY do things, don't just describe them:
   about the calendar -> `list_calendar_events`.
 - "Check my email / any action items?" -> `check_email`, then `capture` real
   action items and deadlines you find.
-- Asked to reply/email someone -> `draft_email` (creates a DRAFT only; tell the
-  user to review and send it — you never send mail yourself).
+- Asked to SEND an email/reply -> `send_email` (it goes out from their Gmail).
+  The app shows an Approve/Cancel card before it actually sends, so just call the
+  tool with a well-written subject and body; don't ask "should I send?" yourself.
+  If the user only wants to review first, or seems unsure, use `draft_email`.
+- "Call <person/number>" -> `place_call`. If they name a saved recording, pass
+  `recording_name`; otherwise pass a short, natural `say` message to speak. Use
+  `list_recordings` if you need to know what's saved. The app shows an
+  Approve/Cancel card before dialling, so just call the tool. You never actually
+  speak on the line — ATLAS plays the recording or the spoken message.
 - "Find / compare / recommend / what's the best..." → `web_search`, then
   `web_read` on the 2-3 most promising results to check details, then give ONE
   clear recommendation with a short reason and the key alternatives. Offer to
@@ -904,21 +1113,25 @@ class ChatIn(BaseModel): messages: list[dict]
 
 # ---- deploy helpers -------------------------------------------------------
 def materialize_google_files():
-    """On a server there's no interactive OAuth. Instead, provide the JSON
-    contents via env vars (GOOGLE_CREDENTIALS_JSON / GOOGLE_TOKEN_JSON, generated
-    locally by authorize.py) and we write them to disk on boot."""
+    """Restore Google credentials/token to disk on boot so calendar_client can use
+    them. Sources (in order): env vars (GOOGLE_CREDENTIALS_JSON / GOOGLE_TOKEN_JSON),
+    then the durable DB copy saved when the user connects via the web button. This
+    is what makes 'Connect Google' survive restarts on ephemeral-disk hosts."""
     cj, tj = os.getenv("GOOGLE_CREDENTIALS_JSON"), os.getenv("GOOGLE_TOKEN_JSON")
     try:
         if cj and not gcal.CREDS.exists(): gcal.CREDS.write_text(cj)
         if tj and not gcal.TOKEN.exists(): gcal.TOKEN.write_text(tj)
+        if not gcal.TOKEN.exists():                    # fall back to durable DB copy
+            saved = get_secret("google_token")
+            if saved: gcal.TOKEN.write_text(saved)
     except Exception as e:
         print("google file materialize failed:", e)
 
 # ---- api ------------------------------------------------------------------
 app = FastAPI(title="ATLAS")
 try:
-    materialize_google_files()
-    init_db()
+    init_db()                      # tables first (app_secrets must exist before we read it)
+    materialize_google_files()     # then restore Google creds/token (may read app_secrets)
 except Exception as _e:
     # Never let a boot-time DB/init hiccup take the whole service down (would 404
     # everything). Log it; DB-backed routes surface the error per-request instead.
@@ -1015,6 +1228,7 @@ def display_name(user):
 @app.get("/api/config")
 def config():
     cfg = auth.public_config(); cfg["push_key"] = push.public_key()
+    cfg["calling_connected"] = calls.is_configured()
     cfg["db"] = "postgres" if store.is_postgres() else "sqlite"
     try:
         with closing(db()) as c:
@@ -1099,6 +1313,107 @@ def api_recurring(user=Depends(auth.current_user)):
 @app.delete("/api/recurring/{rid}")
 def api_remove_recurring(rid: int, user=Depends(auth.current_user)):
     return remove_recurring(user["id"], rid)
+
+# ---- recordings library + calling -----------------------------------------
+class RecordingIn(BaseModel):
+    name: str
+    kind: str = "tts"          # 'tts' | 'audio'
+    text: str | None = None
+    audio_b64: str | None = None
+    mime: str | None = None
+
+@app.get("/api/recordings")
+def api_recordings(user=Depends(auth.current_user)):
+    return list_recordings(user["id"])
+
+@app.post("/api/recordings")
+def api_add_recording(inp: RecordingIn, user=Depends(auth.current_user)):
+    return add_recording(user["id"], inp.name.strip() or "Untitled", inp.kind,
+                         text=inp.text, audio_b64=inp.audio_b64, mime=inp.mime)
+
+@app.delete("/api/recordings/{rid}")
+def api_delete_recording(rid: int, user=Depends(auth.current_user)):
+    return delete_recording(user["id"], rid)
+
+@app.get("/api/calls")
+def api_calls(user=Depends(auth.current_user)):
+    return list_call_history(user["id"])
+
+@app.get("/media/recordings/{media_token}")
+def media_recording(media_token: str):
+    """Public (Twilio + the in-app player fetch this) — token is unguessable."""
+    from fastapi.responses import Response
+    got = recording_audio(media_token)
+    if not got:
+        raise HTTPException(404, "not found")
+    audio, mime = got
+    return Response(content=audio, media_type=mime)
+
+@app.api_route("/api/twiml/{token}", methods=["GET", "POST"])
+def twiml(token: str):
+    """Twilio calls this when the person answers — returns what to play/say."""
+    from fastapi.responses import Response
+    job = get_call_job(token)
+    if not job:
+        return Response(calls.twiml_say("This call could not be set up. Goodbye."),
+                        media_type="application/xml")
+    if job.get("recording_id"):
+        rec = get_recording(job["user_id"], job["recording_id"])
+        if rec and rec.get("kind") == "audio" and rec.get("media_token"):
+            url = f"{calls.public_base()}/media/recordings/{rec['media_token']}"
+            return Response(calls.twiml_play(url), media_type="application/xml")
+        if rec and rec.get("text"):
+            return Response(calls.twiml_say(rec["text"]), media_type="application/xml")
+    return Response(calls.twiml_say(job.get("say_text") or "Hello from ATLAS."),
+                    media_type="application/xml")
+
+# ---- Google connect (web OAuth, works on Render unlike local authorize.py) ---
+def _oauth_base(request: Request) -> str:
+    """The public origin to build redirect URIs from. Prefer PUBLIC_BASE_URL (set
+    on Render); fall back to the request's own origin for local use."""
+    return calls.public_base() or str(request.base_url).rstrip("/")
+
+def _google_flow(base: str):
+    from google_auth_oauthlib.flow import Flow
+    if not gcal.CREDS.exists():
+        raise HTTPException(400, "Google client not set up (credentials.json missing).")
+    return Flow.from_client_secrets_file(
+        str(gcal.CREDS), scopes=gcal.SCOPES,
+        redirect_uri=f"{base}/api/google/callback")
+
+@app.get("/api/google/start")
+def google_start(request: Request):
+    """Kick off Google consent. Full-page redirect to Google's sign-in."""
+    base = _oauth_base(request)
+    try:
+        flow = _google_flow(base)
+        url, _state = flow.authorization_url(
+            access_type="offline", prompt="consent", include_granted_scopes="true")
+    except HTTPException:
+        raise
+    except Exception as e:
+        return RedirectResponse(f"/?google=error&msg={_q(str(e)[:120])}")
+    return RedirectResponse(url)
+
+@app.get("/api/google/callback")
+def google_callback(request: Request):
+    """Google redirects back here with a code; exchange it and save the token
+    (to disk for immediate use + to the DB so it survives restarts)."""
+    base = _oauth_base(request)
+    try:
+        flow = _google_flow(base)
+        # Rebuild the authorization response against the public base so the scheme
+        # matches the registered redirect_uri even behind Render's proxy.
+        authz = f"{base}{request.url.path}"
+        if request.url.query:
+            authz += f"?{request.url.query}"
+        flow.fetch_token(authorization_response=authz)
+        tok = flow.credentials.to_json()
+        gcal.TOKEN.write_text(tok)
+        set_secret("google_token", tok)
+    except Exception as e:
+        return RedirectResponse(f"/?google=error&msg={_q(str(e)[:160])}")
+    return RedirectResponse("/?google=connected")
 
 @app.get("/")
 def index(): return FileResponse(FRONTEND / "index.html")
